@@ -39,3 +39,6 @@ include = ["core*", "export*", "ui*", "workers*"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-v --tb=short --no-header -p no:warnings"
+
+[tool.setuptools]
+py-modules = ["main", "config"]
