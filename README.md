@@ -13,19 +13,34 @@ Convert any image into 3D-printable spray-paint stencil plates.
 chmod +x run.sh && ./run.sh
 ```
 
-The script installs all dependencies into a local `.venv` and launches the app.
+`run.sh` now does a single editable install (`pip install -e .`) into `.venv` and launches the app.
 
 ## Manual install
 
 ```bash
-pip install -e .          # installs all runtime deps from pyproject.toml
-python main.py            # launch
+python -m venv .venv
+source .venv/bin/activate
+pip install -e .
+stencil-generator
+```
+
+## Project structure
+
+```text
+.
+├── core/      # quantization, tiling, geometry, mesh building
+├── ui/        # main window + widgets/dialogs
+├── workers/   # background generation thread
+├── export/    # STL and HTML guide output
+├── config.py  # global constants/tuning
+├── main.py    # desktop entry point
+└── run.sh     # one-command setup/launch
 ```
 
 ## Run tests
 
 ```bash
-pip install -e ".[dev]"
+pip install -e "[dev]"
 pytest
 ```
 
