@@ -85,7 +85,7 @@ class GeneratorWorker(QThread):
         canvas_h_mm  = float(p["canvas_h_mm"])
         bed_w_mm     = float(p["bed_w_mm"])
         bed_h_mm     = float(p["bed_h_mm"])
-        n_colors     = int(p["n_colors"])
+        requested_n_colors = int(p["n_colors"])
         thickness_mm = float(p["thickness_mm"])
         # None or empty list both mean "all owned"
         _owned = p.get("owned_colour_indices", None)
@@ -111,8 +111,11 @@ class GeneratorWorker(QThread):
             return
 
         # ── Step 2 — K-means quantization ────────────────────────────────────
-        self._log(f"🎨  Quantising to {n_colors} colours (K-means)…")
-        qr: QuantizeResult = quantize(scaled, n_colors)
+        self._log(f"🎨  Quantising to {requested_n_colors} colours (K-means)…")
+        qr: QuantizeResult = quantize(scaled, requested_n_colors)
+        n_colors = qr.n_colors
+        if n_colors != requested_n_colors:
+            self._log(f"    Requested {requested_n_colors}, effective {n_colors} based on image detail")
         self._progress(10)
 
         if self._abort:
