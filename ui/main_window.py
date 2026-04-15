@@ -22,7 +22,9 @@ from PyQt5.QtWidgets import (
     QMessageBox,
     QProgressBar,
     QPushButton,
+    QScrollArea,
     QSplitter,
+    QTabWidget,
     QTextEdit,
     QToolButton,
     QVBoxLayout,
@@ -68,6 +70,12 @@ QProgressBar::chunk { background: #e94560; border-radius: 5px; }
 QSplitter::handle { background: #2e2e4a; }
 QListWidget { background:#0d0d1a; border:1px solid #2e2e4a; border-radius:6px; }
 QToolButton { background:transparent; border:none; color:#a0c4ff; font-size:18px; }
+QTabWidget::pane { border:1px solid #2e2e4a; border-radius:6px; }
+QTabBar::tab {
+    background:#1a1a2a; color:#bbb; padding:6px 10px; margin-right:2px;
+    border-top-left-radius:5px; border-top-right-radius:5px;
+}
+QTabBar::tab:selected { background:#253560; color:#fff; }
 """
 
 
@@ -84,6 +92,8 @@ class MainWindow(QMainWindow):
         self._plates: list[PlateInfo] = []
         self._output_dir = str(Path.cwd())
         self._last_qr = None
+        self._last_color_coverage = []
+        self._color_logic_valid = True
 
         self._build_ui()
 
@@ -98,7 +108,8 @@ class MainWindow(QMainWindow):
         top.addStretch()
         self._settings_btn = QToolButton()
         self._settings_btn.setText("⚙")
-        self._settings_btn.setToolTip("Settings (coming soon)")
+        self._settings_btn.setToolTip("Settings")
+        self._settings_btn.clicked.connect(self._on_settings_clicked)
         top.addWidget(self._settings_btn)
         root.addLayout(top)
 
@@ -109,11 +120,17 @@ class MainWindow(QMainWindow):
         self._panel = ControlPanel()
         self._panel.upload_btn.clicked.connect(self._on_upload)
         self._panel.colors_changed.connect(self._on_colors_changed)
+        self._panel.settings_changed.connect(self._on_preview)
+        self._panel.color_logic_changed.connect(self._on_color_logic_changed)
         self._panel.generate_requested.connect(self._on_generate)
         self._panel.export_requested.connect(self._on_export)
         self._panel.grid_preview_pressed.connect(self._show_grid_preview)
         self._panel.grid_preview_released.connect(self._hide_grid_preview)
-        body.addWidget(self._panel)
+        panel_scroll = QScrollArea()
+        panel_scroll.setWidgetResizable(True)
+        panel_scroll.setFrameShape(QFrame.NoFrame)
+        panel_scroll.setWidget(self._panel)
+        body.addWidget(panel_scroll)
 
         right = QWidget()
         right_layout = QHBoxLayout(right)
@@ -141,13 +158,19 @@ class MainWindow(QMainWindow):
         right_layout.addWidget(center_split, stretch=1)
 
         self._layers_panel = QFrame()
-        self._layers_panel.setFixedWidth(280)
+        self._layers_panel.setMinimumWidth(310)
         self._layers_panel.setStyleSheet("background:#0d0d1a; border-radius:8px; border:1px solid #2e2e4a;")
         lp = QVBoxLayout(self._layers_panel)
-        lp.addWidget(QLabel("Stencil Layers"))
+        self._layers_tabs = QTabWidget()
+        self._color_layer_list = QListWidget()
         self._layer_list = QListWidget()
         self._layer_list.itemChanged.connect(self._on_layer_visibility_changed)
-        lp.addWidget(self._layer_list)
+        self._color_layer_list.itemChanged.connect(self._on_layer_visibility_changed)
+        self._layers_tabs.addTab(self._color_layer_list, "Colour Layers")
+        self._layers_tabs.addTab(self._layer_list, "Stencil Layers")
+        self._layers_tabs.setCurrentIndex(0)
+        self._layers_tabs.currentChanged.connect(lambda _i: self._apply_layer_preview())
+        lp.addWidget(self._layers_tabs)
         lp.addWidget(QLabel("Stencil logic"))
         self._logic_text = QTextEdit()
         self._logic_text.setReadOnly(True)
@@ -185,14 +208,21 @@ class MainWindow(QMainWindow):
         if self._raw_image is not None:
             self._on_preview()
 
+    def _on_color_logic_changed(self):
+        self._update_color_logic_state()
+        self._apply_layer_preview()
+
     def _on_preview(self):
         if self._raw_image is None:
             return
         requested = self._panel.n_colors.value()
         self._last_qr = quantize(self._raw_image, requested)
-        used = self._last_qr.n_colors
-        self._preview.show_image(self._last_qr.quantized_image, f"Quantised Preview ({used} colours)")
+        self._last_color_coverage = self._compute_coverage(self._last_qr.label_map, self._last_qr.n_colors)
+        self._update_color_logic_state()
+        used = self._effective_color_count()
+        self._preview.show_image(self._last_qr.quantized_image, f"Quantised Preview ({used} active colours)")
         self._panel.swatch_bar.set_colors([tuple(c) for c in self._last_qr.centers_bgr.tolist()])
+        self._update_color_logic_state()
 
     def _show_grid_preview(self):
         if self._raw_image is None:
@@ -207,6 +237,9 @@ class MainWindow(QMainWindow):
     def _on_generate(self):
         if self._image_path is None:
             QMessageBox.warning(self, "No image", "Please upload an image first.")
+            return
+        if not self._color_logic_valid:
+            QMessageBox.warning(self, "Invalid colour logic", "Fix colour logic warning before generating.")
             return
 
         self._log.clear()
@@ -240,12 +273,15 @@ class MainWindow(QMainWindow):
             params["canvas_h_mm"],
             params["bed_w_mm"],
             params["bed_h_mm"],
-            params["n_colors"],
+            self._effective_color_count(),
             grid.n_cols,
             grid.n_rows,
             parent=self,
         )
         dlg.exec_()
+
+    def _on_settings_clicked(self):
+        QMessageBox.information(self, "Settings", "Global settings are not implemented yet.")
 
     def _append_log(self, msg: str):
         self._log.append(msg)
@@ -264,10 +300,13 @@ class MainWindow(QMainWindow):
 
     def _populate_layers_panel(self):
         self._layer_list.blockSignals(True)
+        self._color_layer_list.blockSignals(True)
         self._layer_list.clear()
+        self._color_layer_list.clear()
         if not self._plates:
             self._layers_panel.hide()
             self._layer_list.blockSignals(False)
+            self._color_layer_list.blockSignals(False)
             return
 
         grouped: dict[int, list[PlateInfo]] = {}
@@ -279,6 +318,10 @@ class MainWindow(QMainWindow):
             item.setFlags(item.flags() | Qt.ItemIsUserCheckable)
             item.setCheckState(Qt.Checked)
             self._layer_list.addItem(item)
+            color_item = QListWidgetItem(f"Colour C{color_idx} ({len(grouped[color_idx])} tile(s))")
+            color_item.setFlags(color_item.flags() | Qt.ItemIsUserCheckable)
+            color_item.setCheckState(Qt.Checked)
+            self._color_layer_list.addItem(color_item)
 
         lines = ["Generated stencil logic:"]
         for color_idx in sorted(grouped):
@@ -288,6 +331,7 @@ class MainWindow(QMainWindow):
 
         self._layers_panel.show()
         self._layer_list.blockSignals(False)
+        self._color_layer_list.blockSignals(False)
         self._apply_layer_preview()
 
     def _on_layer_visibility_changed(self, _item: QListWidgetItem):
@@ -297,8 +341,9 @@ class MainWindow(QMainWindow):
         if self._last_qr is None:
             return
         visible_idxs: set[int] = set()
-        for i in range(self._layer_list.count()):
-            item = self._layer_list.item(i)
+        active_list = self._color_layer_list if self._layers_tabs.currentIndex() == 0 else self._layer_list
+        for i in range(active_list.count()):
+            item = active_list.item(i)
             if item.checkState() == Qt.Checked:
                 label = item.text().split()[1]  # Cx
                 visible_idxs.add(int(label[1:]) - 1)
@@ -313,7 +358,48 @@ class MainWindow(QMainWindow):
         mask = np.isin(labels, list(visible_idxs))
         faded = (out * 0.15).astype(np.uint8)
         out[~mask] = faded[~mask]
+        edge_map = cv2.Canny((mask.astype(np.uint8) * 255), 70, 130)
+        out[edge_map > 0] = (255, 255, 255)
         self._preview.show_image(out, f"Layer Preview ({len(visible_idxs)} visible)")
+
+    def _compute_coverage(self, label_map: np.ndarray, n_colors: int) -> list[float]:
+        total = float(label_map.size)
+        if total <= 0:
+            return [0.0] * n_colors
+        return [100.0 * float(np.mean(label_map == i)) for i in range(n_colors)]
+
+    def _effective_color_count(self) -> int:
+        if self._last_qr is None:
+            return 0
+        tolerance = float(self._panel.tol_slider.value())
+        skipped = set(self._panel.swatch_bar.skipped_indices())
+        active = 0
+        for idx in range(self._last_qr.n_colors):
+            coverage = self._last_color_coverage[idx] if idx < len(self._last_color_coverage) else 0.0
+            if idx in skipped:
+                continue
+            if coverage < tolerance:
+                continue
+            active += 1
+        return active
+
+    def _update_color_logic_state(self):
+        effective = self._effective_color_count()
+        self._panel.set_real_color_count(effective)
+        requested = self._panel.n_colors.value()
+        skipped = len(self._panel.swatch_bar.skipped_indices())
+        valid = requested >= skipped
+        self._color_logic_valid = valid
+        if valid:
+            self._panel.set_color_logic_validity(True)
+        else:
+            self._panel.set_color_logic_validity(
+                False,
+                f"Maximum colours ({requested}) is below skipped colours ({skipped}).",
+            )
+        has_img = self._raw_image is not None
+        self._panel.generate_btn.setEnabled(has_img and valid)
+        self._panel.export_btn.setEnabled(bool(self._plates) and valid)
 
     def _on_error(self, msg: str):
         self._panel.set_generating(False)

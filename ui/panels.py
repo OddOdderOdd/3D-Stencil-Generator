@@ -36,6 +36,7 @@ from config import (
 
 class ColourLogicBar(QWidget):
     """Quantised colours + ownership logic controls, persisted with QSettings."""
+    state_changed = pyqtSignal()
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -46,12 +47,9 @@ class ColourLogicBar(QWidget):
         self._rows: list[dict] = []
 
         top = QHBoxLayout()
-        self.logic_enabled = QCheckBox("Enable")
-        self.logic_enabled.setChecked(True)
         self.no_limit = QCheckBox("No limit")
         self.no_limit.setChecked(True)
         self.no_limit.toggled.connect(self._on_no_limit_toggled)
-        top.addWidget(self.logic_enabled)
         top.addWidget(self.no_limit)
         top.addStretch()
         self._layout.addLayout(top)
@@ -116,6 +114,7 @@ class ColourLogicBar(QWidget):
     def _on_no_limit_toggled(self, checked: bool):
         for row in self._rows:
             row["btn"].setEnabled(not checked)
+        self.state_changed.emit()
 
     def set_colors(self, bgr_list: list[tuple[int, int, int]]):
         while self._layout.count() > 3:
@@ -152,6 +151,7 @@ class ColourLogicBar(QWidget):
             skip_btn.setChecked(should_skip)
             self._sync_skip_style(skip_btn)
             skip_btn.toggled.connect(lambda state, b=skip_btn: self._sync_skip_style(b))
+            skip_btn.toggled.connect(self.state_changed.emit)
 
             row_layout.addWidget(swatch)
             row_layout.addWidget(label)
@@ -161,6 +161,7 @@ class ColourLogicBar(QWidget):
 
             skip_btn.setEnabled(not no_limit)
             self._rows.append({"idx": idx, "hex": hx, "btn": skip_btn})
+        self.state_changed.emit()
 
     def _sync_skip_style(self, btn: QPushButton):
         if btn.isChecked():
@@ -169,13 +170,20 @@ class ColourLogicBar(QWidget):
             btn.setStyleSheet("")
 
     def owned_indices(self) -> list[int]:
-        if self.no_limit.isChecked() or not self.logic_enabled.isChecked():
+        if self.no_limit.isChecked():
             return []
         return [r["idx"] for r in self._rows if not r["btn"].isChecked()]
+
+    def skipped_indices(self) -> list[int]:
+        if self.no_limit.isChecked():
+            return []
+        return [r["idx"] for r in self._rows if r["btn"].isChecked()]
 
 
 class ControlPanel(QWidget):
     colors_changed = pyqtSignal(int)
+    settings_changed = pyqtSignal()
+    color_logic_changed = pyqtSignal()
     generate_requested = pyqtSignal()
     export_requested = pyqtSignal()
     grid_preview_pressed = pyqtSignal()
@@ -183,7 +191,7 @@ class ControlPanel(QWidget):
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.setFixedWidth(340)
+        self.setMinimumWidth(360)
         root = QVBoxLayout(self)
         root.setContentsMargins(0, 0, 8, 0)
         root.setSpacing(10)
@@ -251,29 +259,51 @@ class ControlPanel(QWidget):
 
         root.addWidget(dim_group)
 
-        param_group = QGroupBox("Stencil Parameters")
-        pg = QGridLayout(param_group)
-        pg.setVerticalSpacing(6)
-
-        pg.addWidget(QLabel("Colours (N):"), 0, 0)
+        pal_group = QGroupBox("Colour logic")
+        pg2 = QVBoxLayout(pal_group)
+        pg2.setSpacing(8)
+        max_row = QHBoxLayout()
+        max_row.addWidget(QLabel("Maximum Colours (mN):"))
         self.n_colors = QSpinBox()
         self.n_colors.setRange(2, 24)
         self.n_colors.setValue(DEFAULT_N_COLORS)
         self.n_colors.valueChanged.connect(self.colors_changed)
-        pg.addWidget(self.n_colors, 0, 1)
+        self.n_colors.valueChanged.connect(self.settings_changed.emit)
+        max_row.addWidget(self.n_colors)
+        pg2.addLayout(max_row)
 
-        pg.addWidget(QLabel("Thickness:"), 1, 0)
+        self.real_n_label = QLabel("Real colours (N): 0")
+        self.real_n_label.setStyleSheet("color:#9aa; font-size:11px;")
+        pg2.addWidget(self.real_n_label)
+
+        self.logic_warning_label = QLabel("")
+        self.logic_warning_label.setStyleSheet("color:#ff6b6b; font-size:11px; font-weight:bold;")
+        self.logic_warning_label.hide()
+        pg2.addWidget(self.logic_warning_label)
+
+        self.swatch_bar = ColourLogicBar()
+        self.swatch_bar.state_changed.connect(self.color_logic_changed.emit)
+        pg2.addWidget(self.swatch_bar)
+        root.addWidget(pal_group)
+
+        param_group = QGroupBox("Stencil Parameters")
+        pg = QGridLayout(param_group)
+        pg.setVerticalSpacing(6)
+
+        pg.addWidget(QLabel("Thickness:"), 0, 0)
         self.thickness = QDoubleSpinBox()
         self.thickness.setRange(0.4, 10.0)
         self.thickness.setValue(DEFAULT_THICKNESS_MM)
         self.thickness.setSingleStep(0.1)
         self.thickness.setSuffix(" mm")
         self.thickness.setDecimals(1)
-        pg.addWidget(self.thickness, 1, 1)
+        self.thickness.valueChanged.connect(self.settings_changed.emit)
+        pg.addWidget(self.thickness, 0, 1)
 
         self.thicken_edges = QCheckBox("Thicken edges  (alignment lip +0.4 mm)")
         self.thicken_edges.setChecked(DEFAULT_THICKEN_EDGES)
-        pg.addWidget(self.thicken_edges, 2, 0, 1, 2)
+        self.thicken_edges.toggled.connect(self.settings_changed.emit)
+        pg.addWidget(self.thicken_edges, 1, 0, 1, 2)
         root.addWidget(param_group)
 
         tol_group = QGroupBox("Tolerance")
@@ -292,14 +322,9 @@ class ControlPanel(QWidget):
         self.tol_slider.setTickInterval(5)
         self.tol_slider.setTickPosition(QSlider.TicksBelow)
         self.tol_slider.valueChanged.connect(lambda v: self.tol_label.setText(f"{v}%"))
+        self.tol_slider.valueChanged.connect(self.settings_changed.emit)
         tg.addWidget(self.tol_slider)
         root.addWidget(tol_group)
-
-        pal_group = QGroupBox("Colour logic")
-        pg2 = QVBoxLayout(pal_group)
-        self.swatch_bar = ColourLogicBar()
-        pg2.addWidget(self.swatch_bar)
-        root.addWidget(pal_group)
 
         root.addStretch()
 
@@ -329,6 +354,17 @@ class ControlPanel(QWidget):
             "tolerance_pct": float(self.tol_slider.value()),
             "owned_colour_indices": self.swatch_bar.owned_indices(),
         }
+
+    def set_real_color_count(self, n: int):
+        self.real_n_label.setText(f"Real colours (N): {n}")
+
+    def set_color_logic_validity(self, valid: bool, message: str = ""):
+        if valid:
+            self.logic_warning_label.hide()
+            self.logic_warning_label.setText("")
+        else:
+            self.logic_warning_label.setText(f"❗ {message}")
+            self.logic_warning_label.show()
 
     def set_image_info(self, filename: str, w: int, h: int):
         self.img_info.setText(f"✓ {filename}  ({w}×{h} px)")
