@@ -9,6 +9,7 @@ from PyQt5.QtCore import Qt, QSettings, pyqtSignal
 from PyQt5.QtGui import QFont
 from PyQt5.QtWidgets import (
     QCheckBox,
+    QColorDialog,
     QDoubleSpinBox,
     QFrame,
     QGridLayout,
@@ -16,6 +17,8 @@ from PyQt5.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QLineEdit,
+    QListWidget,
+    QListWidgetItem,
     QPushButton,
     QSpinBox,
     QVBoxLayout,
@@ -46,13 +49,30 @@ class ColourLogicBar(QWidget):
         self._layout.setSpacing(6)
         self._rows: list[dict] = []
 
+        comp_group = QGroupBox("Computer colours")
+        comp_layout = QVBoxLayout(comp_group)
+        comp_layout.setContentsMargins(8, 8, 8, 8)
+        comp_layout.setSpacing(6)
+        self._layout.addWidget(comp_group)
+
         top = QHBoxLayout()
         self.no_limit = QCheckBox("No limit")
         self.no_limit.setChecked(False)
         self.no_limit.toggled.connect(self._on_no_limit_toggled)
         top.addWidget(self.no_limit)
         top.addStretch()
-        self._layout.addLayout(top)
+        comp_layout.addLayout(top)
+
+        self._computer_rows_layout = QVBoxLayout()
+        self._computer_rows_layout.setContentsMargins(0, 0, 0, 0)
+        self._computer_rows_layout.setSpacing(4)
+        comp_layout.addLayout(self._computer_rows_layout)
+
+        own_group = QGroupBox("Owned colours")
+        own_layout = QVBoxLayout(own_group)
+        own_layout.setContentsMargins(8, 8, 8, 8)
+        own_layout.setSpacing(6)
+        self._layout.addWidget(own_group)
 
         add_row = QHBoxLayout()
         self.hex_input = QLineEdit()
@@ -60,15 +80,25 @@ class ColourLogicBar(QWidget):
         self.hex_input.setMaxLength(7)
         self.add_btn = QPushButton("Add")
         self.add_btn.clicked.connect(self._add_owned_hex)
-        add_row.addWidget(QLabel("Owned hex:"))
+        add_row.addWidget(QLabel("HTML/HEX:"))
         add_row.addWidget(self.hex_input, stretch=1)
         add_row.addWidget(self.add_btn)
-        self._layout.addLayout(add_row)
+        own_layout.addLayout(add_row)
 
-        self.owned_list = QLabel()
-        self.owned_list.setWordWrap(True)
-        self.owned_list.setStyleSheet("color:#9aa; font-size:10px;")
-        self._layout.addWidget(self.owned_list)
+        pick_row = QHBoxLayout()
+        self.pick_btn = QPushButton("Pick colour…")
+        self.pick_btn.setToolTip("Open HEX colour wheel and picker.")
+        self.pick_btn.clicked.connect(self._pick_owned_colour)
+        self.remove_btn = QPushButton("Remove selected")
+        self.remove_btn.clicked.connect(self._remove_selected_owned)
+        pick_row.addWidget(self.pick_btn)
+        pick_row.addWidget(self.remove_btn)
+        own_layout.addLayout(pick_row)
+
+        self.owned_list = QListWidget()
+        self.owned_list.setSelectionMode(QListWidget.SingleSelection)
+        self.owned_list.setMaximumHeight(120)
+        own_layout.addWidget(self.owned_list)
 
         self._load_owned_hexes()
 
@@ -95,10 +125,11 @@ class ColourLogicBar(QWidget):
         self._settings.setValue("owned_hexes", self._owned_hexes)
 
     def _render_owned_hexes(self):
-        if not self._owned_hexes:
-            self.owned_list.setText("Saved owned colours: (none)")
-        else:
-            self.owned_list.setText("Saved owned colours: " + ", ".join(self._owned_hexes))
+        self.owned_list.clear()
+        for hx in self._owned_hexes:
+            item = QListWidgetItem(hx)
+            item.setToolTip(hx)
+            self.owned_list.addItem(item)
 
     def _add_owned_hex(self):
         hx = self._normalize_hex(self.hex_input.text())
@@ -109,7 +140,28 @@ class ColourLogicBar(QWidget):
             self._owned_hexes.sort()
             self._save_owned_hexes()
             self._render_owned_hexes()
+            self.state_changed.emit()
         self.hex_input.clear()
+
+    def _pick_owned_colour(self):
+        color = QColorDialog.getColor(parent=self, title="Pick owned colour")
+        if not color.isValid():
+            return
+        self.hex_input.setText(color.name().upper())
+        self._add_owned_hex()
+
+    def _remove_selected_owned(self):
+        item = self.owned_list.currentItem()
+        if item is None:
+            return
+        hx = self._normalize_hex(item.text())
+        if not hx:
+            return
+        if hx in self._owned_hexes:
+            self._owned_hexes.remove(hx)
+            self._save_owned_hexes()
+            self._render_owned_hexes()
+            self.state_changed.emit()
 
     def _on_no_limit_toggled(self, checked: bool):
         for row in self._rows:
@@ -117,8 +169,8 @@ class ColourLogicBar(QWidget):
         self.state_changed.emit()
 
     def set_colors(self, bgr_list: list[tuple[int, int, int]]):
-        while self._layout.count() > 3:
-            item = self._layout.takeAt(3)
+        while self._computer_rows_layout.count() > 0:
+            item = self._computer_rows_layout.takeAt(0)
             if item.widget():
                 item.widget().deleteLater()
         self._rows.clear()
@@ -143,41 +195,41 @@ class ColourLogicBar(QWidget):
             label = QLabel(f"C{idx+1}  {hx}")
             label.setStyleSheet("font-size: 11px; color: #e0e0e0;")
 
-            skip_btn = QPushButton("Skip")
-            skip_btn.setCheckable(True)
-            skip_btn.setFixedHeight(24)
-            skip_btn.setToolTip("Highlighted means this colour will not be used.")
-            should_skip = (not no_limit) and bool(owned_set) and (hx not in owned_set)
-            skip_btn.setChecked(should_skip)
-            self._sync_skip_style(skip_btn)
-            skip_btn.toggled.connect(lambda state, b=skip_btn: self._sync_skip_style(b))
-            skip_btn.toggled.connect(self.state_changed.emit)
+            use_btn = QPushButton("Use")
+            use_btn.setCheckable(True)
+            use_btn.setFixedHeight(24)
+            use_btn.setToolTip("Enabled means this colour layer will be used.")
+            should_use = no_limit or (not owned_set) or (hx in owned_set)
+            use_btn.setChecked(should_use)
+            self._sync_use_style(use_btn)
+            use_btn.toggled.connect(lambda state, b=use_btn: self._sync_use_style(b))
+            use_btn.toggled.connect(self.state_changed.emit)
 
             row_layout.addWidget(swatch)
             row_layout.addWidget(label)
             row_layout.addStretch()
-            row_layout.addWidget(skip_btn)
-            self._layout.addWidget(row_widget)
+            row_layout.addWidget(use_btn)
+            self._computer_rows_layout.addWidget(row_widget)
 
-            skip_btn.setEnabled(not no_limit)
-            self._rows.append({"idx": idx, "hex": hx, "btn": skip_btn})
+            use_btn.setEnabled(not no_limit)
+            self._rows.append({"idx": idx, "hex": hx, "btn": use_btn})
         self.state_changed.emit()
 
-    def _sync_skip_style(self, btn: QPushButton):
+    def _sync_use_style(self, btn: QPushButton):
         if btn.isChecked():
-            btn.setStyleSheet("background:#e94560; color:white; font-weight:bold;")
+            btn.setStyleSheet("background:#42b883; color:white; font-weight:bold;")
         else:
-            btn.setStyleSheet("")
+            btn.setStyleSheet("background:#4b2230; color:#ffb3c1;")
 
     def owned_indices(self) -> list[int]:
         if self.no_limit.isChecked():
-            return []
-        return [r["idx"] for r in self._rows if not r["btn"].isChecked()]
+            return [r["idx"] for r in self._rows]
+        return [r["idx"] for r in self._rows if r["btn"].isChecked()]
 
     def skipped_indices(self) -> list[int]:
         if self.no_limit.isChecked():
             return []
-        return [r["idx"] for r in self._rows if r["btn"].isChecked()]
+        return [r["idx"] for r in self._rows if not r["btn"].isChecked()]
 
 
 class ControlPanel(QWidget):
