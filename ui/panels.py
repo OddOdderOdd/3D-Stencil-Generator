@@ -35,6 +35,8 @@ class ColourLogicBar(QWidget):
     """Quantised colours + ownership logic controls, persisted with QSettings."""
     state_changed = pyqtSignal()
     optimise_requested = pyqtSignal()
+    optimise_owned_requested = pyqtSignal()
+    optimise_background_requested = pyqtSignal()
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -44,6 +46,35 @@ class ColourLogicBar(QWidget):
         self._layout.setSpacing(6)
         self._rows: list[dict] = []
         self._owned_rows: list[dict] = []
+        self._background_hex = "#FFFFFF"
+        self._background_enabled = True
+
+        bg_group = QGroupBox("Background colour")
+        bg_layout = QVBoxLayout(bg_group)
+        bg_layout.setContentsMargins(8, 8, 8, 8)
+        bg_layout.setSpacing(6)
+        self._layout.addWidget(bg_group)
+
+        self.bg_enable = QCheckBox("Enable background colour logic")
+        self.bg_enable.setChecked(True)
+        self.bg_enable.toggled.connect(self._set_background_enabled)
+        self.bg_enable.toggled.connect(self.state_changed.emit)
+        bg_layout.addWidget(self.bg_enable)
+
+        bg_actions = QHBoxLayout()
+        self.bg_pick_btn = QPushButton("Pick colour…")
+        self.bg_pick_btn.clicked.connect(self._pick_background_colour)
+        self.bg_optimise_btn = QPushButton("Optimise")
+        self.bg_optimise_btn.setToolTip("Set B0 to the most dominant colour in the image.")
+        self.bg_optimise_btn.clicked.connect(self.optimise_background_requested.emit)
+        bg_actions.addWidget(self.bg_pick_btn)
+        bg_actions.addWidget(self.bg_optimise_btn)
+        bg_layout.addLayout(bg_actions)
+
+        self._bg_label = QLabel()
+        self._bg_label.setStyleSheet("font-size: 11px; color: #e0e0e0;")
+        bg_layout.addWidget(self._bg_label)
+        self._refresh_background_label()
 
         own_group = QGroupBox("Owned colours")
         own_layout = QVBoxLayout(own_group)
@@ -70,9 +101,13 @@ class ColourLogicBar(QWidget):
         self.import_btn.clicked.connect(self._import_owned_colours)
         self.save_btn = QPushButton("Save")
         self.save_btn.clicked.connect(self._save_owned_colours)
+        self.optimise_owned_btn = QPushButton("Optimise")
+        self.optimise_owned_btn.setToolTip("Optimise 'Use' for owned colours only.")
+        self.optimise_owned_btn.clicked.connect(self.optimise_owned_requested.emit)
         pick_row.addWidget(self.pick_btn)
         pick_row.addWidget(self.import_btn)
         pick_row.addWidget(self.save_btn)
+        pick_row.addWidget(self.optimise_owned_btn)
         own_layout.addLayout(pick_row)
 
         self._owned_rows_layout = QVBoxLayout()
@@ -123,11 +158,13 @@ class ColourLogicBar(QWidget):
             if isinstance(rec, dict):
                 hx = self._normalize_hex(rec.get("hex", ""))
                 use = bool(rec.get("use", True))
+                lock = bool(rec.get("lock", True))
             else:
                 hx = self._normalize_hex(str(rec))
                 use = True
+                lock = True
             if hx:
-                self._owned_entries.append({"hex": hx, "use": use})
+                self._owned_entries.append({"hex": hx, "use": use, "lock": lock})
         self._owned_entries.sort(key=lambda e: e["hex"])
         self._render_owned_hexes()
 
@@ -162,7 +199,17 @@ class ColourLogicBar(QWidget):
             self._sync_use_style(use_btn)
             use_btn.toggled.connect(lambda state, b=use_btn: self._sync_use_style(b))
             use_btn.toggled.connect(lambda state, h=hx: self._set_owned_use(h, state))
+            use_btn.toggled.connect(self._refresh_computer_identifiers)
             use_btn.toggled.connect(self.state_changed.emit)
+
+            lock_btn = QPushButton("🔒")
+            lock_btn.setCheckable(True)
+            lock_btn.setFixedSize(24, 24)
+            lock_btn.setChecked(bool(entry.get("lock", True)))
+            self._sync_lock_style(lock_btn)
+            lock_btn.toggled.connect(lambda state, b=lock_btn: self._sync_lock_style(b))
+            lock_btn.toggled.connect(lambda state, h=hx: self._set_owned_lock(h, state))
+            lock_btn.toggled.connect(self.state_changed.emit)
 
             remove_btn = QPushButton("✕")
             remove_btn.setFixedSize(24, 24)
@@ -172,16 +219,17 @@ class ColourLogicBar(QWidget):
             row_layout.addWidget(label)
             row_layout.addStretch()
             row_layout.addWidget(use_btn)
+            row_layout.addWidget(lock_btn)
             row_layout.addWidget(remove_btn)
             self._owned_rows_layout.addWidget(row_widget)
-            self._owned_rows.append({"hex": hx, "btn": use_btn})
+            self._owned_rows.append({"hex": hx, "btn": use_btn, "lock_btn": lock_btn})
 
     def _add_owned_hex(self):
         hx = self._normalize_hex(self.hex_input.text())
         if not hx:
             return
         if hx not in [e["hex"] for e in self._owned_entries]:
-            self._owned_entries.append({"hex": hx, "use": True})
+            self._owned_entries.append({"hex": hx, "use": True, "lock": True})
             self._owned_entries.sort(key=lambda e: e["hex"])
             self._save_owned_hexes()
             self._render_owned_hexes()
@@ -203,6 +251,13 @@ class ColourLogicBar(QWidget):
                 break
         self._save_owned_hexes()
 
+    def _set_owned_lock(self, hx: str, locked: bool):
+        for entry in self._owned_entries:
+            if entry["hex"] == hx:
+                entry["lock"] = bool(locked)
+                break
+        self._save_owned_hexes()
+
     def _remove_owned_hex(self, hx: str):
         self._owned_entries = [e for e in self._owned_entries if e["hex"] != hx]
         self._save_owned_hexes()
@@ -218,7 +273,7 @@ class ColourLogicBar(QWidget):
         merged = {e["hex"]: e for e in self._owned_entries}
         for hx in lines:
             if hx and hx not in merged:
-                merged[hx] = {"hex": hx, "use": True}
+                merged[hx] = {"hex": hx, "use": True, "lock": True}
         self._owned_entries = sorted(merged.values(), key=lambda e: e["hex"])
         self._save_owned_hexes()
         self._render_owned_hexes()
@@ -232,6 +287,7 @@ class ColourLogicBar(QWidget):
             f.write("\n".join(e["hex"] for e in self._owned_entries))
 
     def set_colors(self, bgr_list: list[tuple[int, int, int]]):
+        previous_state = {row["hex"]: {"use": row["btn"].isChecked(), "lock": row["lock_btn"].isChecked()} for row in self._rows}
         while self._computer_rows_layout.count() > 0:
             item = self._computer_rows_layout.takeAt(0)
             if item.widget():
@@ -259,38 +315,84 @@ class ColourLogicBar(QWidget):
             use_btn = QPushButton("Use")
             use_btn.setCheckable(True)
             use_btn.setFixedHeight(24)
-            should_use = (not in_use_owned) or (hx in in_use_owned)
+            should_use = previous_state.get(hx, {}).get("use", (not in_use_owned) or (hx in in_use_owned))
             use_btn.setChecked(should_use)
             self._sync_use_style(use_btn)
             use_btn.toggled.connect(lambda state, b=use_btn: self._sync_use_style(b))
             use_btn.toggled.connect(self._refresh_computer_identifiers)
             use_btn.toggled.connect(self.state_changed.emit)
 
+            lock_btn = QPushButton("🔓")
+            lock_btn.setCheckable(True)
+            lock_btn.setFixedSize(24, 24)
+            lock_btn.setChecked(previous_state.get(hx, {}).get("lock", False))
+            self._sync_lock_style(lock_btn)
+            lock_btn.toggled.connect(lambda state, b=lock_btn: self._sync_lock_style(b))
+            lock_btn.toggled.connect(self.state_changed.emit)
+
             row_layout.addWidget(swatch)
             row_layout.addWidget(label)
             row_layout.addStretch()
             row_layout.addWidget(use_btn)
+            row_layout.addWidget(lock_btn)
             self._computer_rows_layout.addWidget(row_widget)
 
-            self._rows.append({"idx": idx, "hex": hx, "btn": use_btn, "label": label})
+            self._rows.append({"idx": idx, "hex": hx, "btn": use_btn, "label": label, "lock_btn": lock_btn})
 
         self._refresh_computer_identifiers()
         self.state_changed.emit()
 
     def _refresh_computer_identifiers(self):
+        owned_rank: dict[str, int] = {}
+        for hx in self.in_use_owned_hexes():
+            if hx not in owned_rank:
+                owned_rank[hx] = len(owned_rank) + 1
         active_i = 1
         for row in self._rows:
             if row["btn"].isChecked():
-                row["label"].setText(f"C{active_i}  {row['hex']}")
-                active_i += 1
+                if row["hex"] in owned_rank:
+                    row["label"].setText(f"O{owned_rank[row['hex']]}  {row['hex']}")
+                else:
+                    row["label"].setText(f"C{active_i}  {row['hex']}")
+                    active_i += 1
             else:
                 row["label"].setText(row["hex"])
+
+    def active_layer_entries(self) -> list[dict]:
+        owned_rank: dict[str, int] = {}
+        for hx in self.in_use_owned_hexes():
+            if hx not in owned_rank:
+                owned_rank[hx] = len(owned_rank) + 1
+
+        entries = []
+        c_rank = 1
+        if self.background_enabled():
+            entries.append({"label": "B0", "source_idx": None, "kind": "background"})
+
+        for row in self._rows:
+            if not row["btn"].isChecked():
+                continue
+            if row["hex"] in owned_rank:
+                label = f"O{owned_rank[row['hex']]}"
+            else:
+                label = f"C{c_rank}"
+                c_rank += 1
+            entries.append({"label": label, "source_idx": row["idx"], "kind": "color"})
+        return entries
 
     def _sync_use_style(self, btn: QPushButton):
         if btn.isChecked():
             btn.setStyleSheet("background:#42b883; color:white; font-weight:bold;")
         else:
             btn.setStyleSheet("background:#4b2230; color:#ffb3c1;")
+
+    def _sync_lock_style(self, btn: QPushButton):
+        if btn.isChecked():
+            btn.setText("🔒")
+            btn.setStyleSheet("background:#1f3f2f; color:#c8ffd7;")
+        else:
+            btn.setText("🔓")
+            btn.setStyleSheet("background:#3f2a1f; color:#ffd8b8;")
 
     def in_use_owned_hexes(self) -> list[str]:
         result = []
@@ -309,14 +411,64 @@ class ColourLogicBar(QWidget):
         if not self._rows:
             return
         best_idx = max(range(len(coverage)), key=lambda i: coverage[i] if i < len(coverage) else 0.0)
+        preferred_hexes = set(self.in_use_owned_hexes())
+        preferred_idxs = {r["idx"] for r in self._rows if r["hex"] in preferred_hexes}
         for row in self._rows:
+            if row["lock_btn"].isChecked():
+                continue
             cov = coverage[row["idx"]] if row["idx"] < len(coverage) else 0.0
-            keep = cov >= tolerance
+            if preferred_idxs:
+                keep = row["idx"] in preferred_idxs and cov >= tolerance
+            else:
+                keep = cov >= tolerance
             if all(c < tolerance for c in coverage):
                 keep = row["idx"] == best_idx
             row["btn"].setChecked(keep)
         self._refresh_computer_identifiers()
         self.state_changed.emit()
+
+    def optimise_owned_for_coverage(self, coverage_by_hex: dict[str, float], tolerance: float):
+        changed = False
+        for entry in self._owned_entries:
+            if entry.get("lock", True):
+                continue
+            keep = coverage_by_hex.get(entry["hex"], 0.0) >= tolerance
+            if entry["use"] != keep:
+                entry["use"] = keep
+                changed = True
+        if changed:
+            self._save_owned_hexes()
+            self._render_owned_hexes()
+        self._refresh_computer_identifiers()
+        self.state_changed.emit()
+
+    def _pick_background_colour(self):
+        color = QColorDialog.getColor(parent=self, title="Pick background colour")
+        if not color.isValid():
+            return
+        self.set_background_hex(color.name().upper())
+
+    def set_background_hex(self, hx: str):
+        normalized = self._normalize_hex(hx)
+        if not normalized:
+            return
+        self._background_hex = normalized
+        self._refresh_background_label()
+        self.state_changed.emit()
+
+    def _set_background_enabled(self, enabled: bool):
+        self._background_enabled = bool(enabled)
+        self._refresh_background_label()
+
+    def background_enabled(self) -> bool:
+        return bool(self._background_enabled)
+
+    def background_hex(self) -> str:
+        return self._background_hex
+
+    def _refresh_background_label(self):
+        state = "enabled" if self._background_enabled else "disabled"
+        self._bg_label.setText(f"B0  {self._background_hex} ({state})")
 
 
 class ControlPanel(QWidget):
@@ -409,7 +561,7 @@ class ControlPanel(QWidget):
         max_row.addWidget(self.n_colors)
         pg2.addLayout(max_row)
 
-        self.real_n_label = QLabel("Real colours (N): 0")
+        self.real_n_label = QLabel("Active colours (n): 0")
         self.real_n_label.setStyleSheet("color:#9aa; font-size:11px;")
         pg2.addWidget(self.real_n_label)
 
@@ -421,6 +573,8 @@ class ControlPanel(QWidget):
         self.swatch_bar = ColourLogicBar()
         self.swatch_bar.state_changed.connect(self.color_logic_changed.emit)
         self.swatch_bar.optimise_requested.connect(self.color_logic_changed.emit)
+        self.swatch_bar.optimise_owned_requested.connect(self.color_logic_changed.emit)
+        self.swatch_bar.optimise_background_requested.connect(self.color_logic_changed.emit)
         pg2.addWidget(self.swatch_bar)
         root.addWidget(pal_group)
 
@@ -491,10 +645,12 @@ class ControlPanel(QWidget):
             "thicken_edges": self.thicken_edges.isChecked(),
             "tolerance_pct": float(self.tol_slider.value()),
             "owned_colour_indices": self.swatch_bar.owned_indices(),
+            "background_hex": self.swatch_bar.background_hex(),
+            "background_enabled": self.swatch_bar.background_enabled(),
         }
 
     def set_real_color_count(self, n: int):
-        self.real_n_label.setText(f"Real colours (N): {n}")
+        self.real_n_label.setText(f"Active colours (n): {n}")
 
     def set_color_logic_validity(self, valid: bool, message: str = ""):
         if valid:

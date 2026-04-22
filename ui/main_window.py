@@ -132,6 +132,8 @@ class MainWindow(QMainWindow):
         self._panel.export_requested.connect(self._on_export)
         self._panel.grid_preview_toggled.connect(self._on_grid_toggle)
         self._panel.swatch_bar.optimise_requested.connect(self._on_optimise_colours)
+        self._panel.swatch_bar.optimise_owned_requested.connect(self._on_optimise_owned_colours)
+        self._panel.swatch_bar.optimise_background_requested.connect(self._on_optimise_background_colour)
         panel_scroll = QScrollArea()
         panel_scroll.setWidgetResizable(True)
         panel_scroll.setFrameShape(QFrame.NoFrame)
@@ -269,6 +271,30 @@ class MainWindow(QMainWindow):
         self._populate_colour_layers_preview()
         self._apply_layer_preview()
 
+    def _on_optimise_owned_colours(self):
+        if self._last_qr is None:
+            return
+        coverage_by_hex: dict[str, float] = {}
+        for idx, bgr in enumerate(self._last_qr.centers_bgr.tolist()):
+            r, g, b = int(bgr[2]), int(bgr[1]), int(bgr[0])
+            hx = f"#{r:02X}{g:02X}{b:02X}"
+            coverage_by_hex[hx] = self._last_color_coverage[idx] if idx < len(self._last_color_coverage) else 0.0
+        self._panel.swatch_bar.optimise_owned_for_coverage(coverage_by_hex, float(self._panel.tol_slider.value()))
+        self._update_color_logic_state()
+        self._populate_colour_layers_preview()
+        self._apply_layer_preview()
+
+    def _on_optimise_background_colour(self):
+        if self._last_qr is None or not self._last_qr.centers_bgr.size:
+            return
+        dominant_idx = int(np.argmax(np.array(self._last_color_coverage))) if self._last_color_coverage else 0
+        dominant_idx = max(0, min(dominant_idx, len(self._last_qr.centers_bgr) - 1))
+        bgr = self._last_qr.centers_bgr[dominant_idx]
+        hx = f"#{int(bgr[2]):02X}{int(bgr[1]):02X}{int(bgr[0]):02X}"
+        self._panel.swatch_bar.set_background_hex(hx)
+        self._populate_colour_layers_preview()
+        self._apply_layer_preview()
+
     def _on_generate(self):
         if self._image_path is None:
             QMessageBox.warning(self, "No image", "Please upload an image first.")
@@ -367,11 +393,11 @@ class MainWindow(QMainWindow):
         self._color_layer_list.clear()
         if self._last_qr is None:
             return
-        allowed_idxs = self._panel.swatch_bar.owned_indices()
-        for order, idx in enumerate(allowed_idxs, start=1):
-            color_item = QListWidgetItem(f"Colour C{order}")
+        for entry in self._panel.swatch_bar.active_layer_entries():
+            color_item = QListWidgetItem(f"Colour {entry['label']}")
             color_item.setFlags(color_item.flags() | Qt.ItemIsUserCheckable)
-            color_item.setData(Qt.UserRole, idx)
+            color_item.setData(Qt.UserRole, entry["source_idx"])
+            color_item.setData(Qt.UserRole + 1, entry["kind"])
             color_item.setCheckState(Qt.Checked)
             self._color_layer_list.addItem(color_item)
 
@@ -390,6 +416,9 @@ class MainWindow(QMainWindow):
             item = active_list.item(i)
             if item.checkState() == Qt.Checked:
                 src_idx = item.data(Qt.UserRole)
+                kind = item.data(Qt.UserRole + 1)
+                if kind == "background":
+                    continue
                 if src_idx is None:
                     label = item.text().split()[1]
                     src_idx = int(label[1:]) - 1
@@ -420,7 +449,7 @@ class MainWindow(QMainWindow):
             return 0
         tolerance = float(self._panel.tol_slider.value())
         skipped = set(self._panel.swatch_bar.skipped_indices())
-        active = 0
+        active = 1 if self._panel.swatch_bar.background_enabled() else 0
         for idx in range(self._last_qr.n_colors):
             coverage = self._last_color_coverage[idx] if idx < len(self._last_color_coverage) else 0.0
             if idx in skipped:
