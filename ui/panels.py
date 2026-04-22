@@ -48,7 +48,7 @@ class ColourLogicBar(QWidget):
 
         top = QHBoxLayout()
         self.no_limit = QCheckBox("No limit")
-        self.no_limit.setChecked(True)
+        self.no_limit.setChecked(False)
         self.no_limit.toggled.connect(self._on_no_limit_toggled)
         top.addWidget(self.no_limit)
         top.addStretch()

@@ -6,6 +6,7 @@ Root PyQt5 application window.
 from __future__ import annotations
 
 import os
+from datetime import datetime
 from pathlib import Path
 
 import cv2
@@ -113,9 +114,9 @@ class MainWindow(QMainWindow):
         top.addWidget(self._settings_btn)
         root.addLayout(top)
 
-        body = QHBoxLayout()
-        body.setSpacing(14)
-        root.addLayout(body, stretch=1)
+        body_split = QSplitter(Qt.Horizontal)
+        body_split.setChildrenCollapsible(False)
+        root.addWidget(body_split, stretch=1)
 
         self._panel = ControlPanel()
         self._panel.upload_btn.clicked.connect(self._on_upload)
@@ -130,7 +131,7 @@ class MainWindow(QMainWindow):
         panel_scroll.setWidgetResizable(True)
         panel_scroll.setFrameShape(QFrame.NoFrame)
         panel_scroll.setWidget(self._panel)
-        body.addWidget(panel_scroll)
+        body_split.addWidget(panel_scroll)
 
         right = QWidget()
         right_layout = QHBoxLayout(right)
@@ -174,11 +175,14 @@ class MainWindow(QMainWindow):
         lp.addWidget(QLabel("Stencil logic"))
         self._logic_text = QTextEdit()
         self._logic_text.setReadOnly(True)
+        self._logic_text.setPlainText("Upload an image to view colour layers.")
         lp.addWidget(self._logic_text)
-        self._layers_panel.hide()
         right_layout.addWidget(self._layers_panel)
 
-        body.addWidget(right, stretch=1)
+        body_split.addWidget(right)
+        body_split.setStretchFactor(0, 0)
+        body_split.setStretchFactor(1, 1)
+        body_split.setSizes([370, 960])
 
     def _on_upload(self):
         path, _ = QFileDialog.getOpenFileName(
@@ -196,7 +200,9 @@ class MainWindow(QMainWindow):
 
         self._image_path = path
         self._raw_image = img
-        self._output_dir = str(Path(path).parent)
+        run_dir = Path(path).parent / f"{Path(path).stem}_stencils_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+        run_dir.mkdir(parents=True, exist_ok=True)
+        self._output_dir = str(run_dir)
         h, w = img.shape[:2]
         self._panel.set_image_info(os.path.basename(path), w, h)
         self._panel.generate_btn.setEnabled(True)
@@ -222,6 +228,7 @@ class MainWindow(QMainWindow):
         used = self._effective_color_count()
         self._preview.show_image(self._last_qr.quantized_image, f"Quantised Preview ({used} active colours)")
         self._panel.swatch_bar.set_colors([tuple(c) for c in self._last_qr.centers_bgr.tolist()])
+        self._populate_colour_layers_preview()
         self._update_color_logic_state()
 
     def _show_grid_preview(self):
@@ -302,9 +309,9 @@ class MainWindow(QMainWindow):
         self._layer_list.blockSignals(True)
         self._color_layer_list.blockSignals(True)
         self._layer_list.clear()
-        self._color_layer_list.clear()
+        self._populate_colour_layers_preview()
         if not self._plates:
-            self._layers_panel.hide()
+            self._logic_text.setPlainText("Generate stencils to view tile-by-tile stencil breakdown.")
             self._layer_list.blockSignals(False)
             self._color_layer_list.blockSignals(False)
             return
@@ -318,21 +325,25 @@ class MainWindow(QMainWindow):
             item.setFlags(item.flags() | Qt.ItemIsUserCheckable)
             item.setCheckState(Qt.Checked)
             self._layer_list.addItem(item)
-            color_item = QListWidgetItem(f"Colour C{color_idx} ({len(grouped[color_idx])} tile(s))")
-            color_item.setFlags(color_item.flags() | Qt.ItemIsUserCheckable)
-            color_item.setCheckState(Qt.Checked)
-            self._color_layer_list.addItem(color_item)
-
         lines = ["Generated stencil logic:"]
         for color_idx in sorted(grouped):
             cov = np.mean([p.coverage_pct for p in grouped[color_idx]])
             lines.append(f"- C{color_idx}: {len(grouped[color_idx])} plate(s), avg coverage {cov:.1f}%")
         self._logic_text.setText("\n".join(lines))
 
-        self._layers_panel.show()
         self._layer_list.blockSignals(False)
         self._color_layer_list.blockSignals(False)
         self._apply_layer_preview()
+
+    def _populate_colour_layers_preview(self):
+        self._color_layer_list.clear()
+        if self._last_qr is None:
+            return
+        for idx in range(self._last_qr.n_colors):
+            color_item = QListWidgetItem(f"Colour C{idx + 1}")
+            color_item.setFlags(color_item.flags() | Qt.ItemIsUserCheckable)
+            color_item.setCheckState(Qt.Checked)
+            self._color_layer_list.addItem(color_item)
 
     def _on_layer_visibility_changed(self, _item: QListWidgetItem):
         self._apply_layer_preview()
