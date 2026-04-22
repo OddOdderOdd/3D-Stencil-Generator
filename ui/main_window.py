@@ -130,8 +130,8 @@ class MainWindow(QMainWindow):
         self._panel.color_logic_changed.connect(self._on_color_logic_changed)
         self._panel.generate_requested.connect(self._on_generate)
         self._panel.export_requested.connect(self._on_export)
-        self._panel.grid_preview_pressed.connect(self._show_grid_preview)
-        self._panel.grid_preview_released.connect(self._hide_grid_preview)
+        self._panel.grid_preview_toggled.connect(self._on_grid_toggle)
+        self._panel.swatch_bar.optimise_requested.connect(self._on_optimise_colours)
         panel_scroll = QScrollArea()
         panel_scroll.setWidgetResizable(True)
         panel_scroll.setFrameShape(QFrame.NoFrame)
@@ -251,15 +251,23 @@ class MainWindow(QMainWindow):
         self._populate_colour_layers_preview()
         self._update_color_logic_state()
 
-    def _show_grid_preview(self):
+    def _on_grid_toggle(self, checked: bool):
+        if not checked:
+            self._preview.set_grid_overlay(0, 0, False)
+            return
         if self._raw_image is None:
             return
         p = self._panel.get_params()
         grid = compute_tile_grid(p["canvas_w_mm"], p["canvas_h_mm"], p["bed_w_mm"], p["bed_h_mm"])
         self._preview.set_grid_overlay(grid.n_cols, grid.n_rows, True)
 
-    def _hide_grid_preview(self):
-        self._preview.set_grid_overlay(0, 0, False)
+    def _on_optimise_colours(self):
+        if self._last_qr is None:
+            return
+        self._panel.swatch_bar.optimise_for_coverage(self._last_color_coverage, float(self._panel.tol_slider.value()))
+        self._update_color_logic_state()
+        self._populate_colour_layers_preview()
+        self._apply_layer_preview()
 
     def _on_generate(self):
         if self._image_path is None:
@@ -359,12 +367,12 @@ class MainWindow(QMainWindow):
         self._color_layer_list.clear()
         if self._last_qr is None:
             return
-        allowed_idxs = set(self._panel.swatch_bar.owned_indices())
-        for idx in range(self._last_qr.n_colors):
-            color_item = QListWidgetItem(f"Colour C{idx + 1}")
+        allowed_idxs = self._panel.swatch_bar.owned_indices()
+        for order, idx in enumerate(allowed_idxs, start=1):
+            color_item = QListWidgetItem(f"Colour C{order}")
             color_item.setFlags(color_item.flags() | Qt.ItemIsUserCheckable)
-            enabled = (not allowed_idxs) or (idx in allowed_idxs)
-            color_item.setCheckState(Qt.Checked if enabled else Qt.Unchecked)
+            color_item.setData(Qt.UserRole, idx)
+            color_item.setCheckState(Qt.Checked)
             self._color_layer_list.addItem(color_item)
 
     def _on_layer_visibility_changed(self, _item: QListWidgetItem):
@@ -381,8 +389,11 @@ class MainWindow(QMainWindow):
         for i in range(active_list.count()):
             item = active_list.item(i)
             if item.checkState() == Qt.Checked:
-                label = item.text().split()[1]  # Cx
-                visible_idxs.add(int(label[1:]) - 1)
+                src_idx = item.data(Qt.UserRole)
+                if src_idx is None:
+                    label = item.text().split()[1]
+                    src_idx = int(label[1:]) - 1
+                visible_idxs.add(int(src_idx))
 
         if not visible_idxs:
             blank = np.zeros_like(self._last_qr.quantized_image)
