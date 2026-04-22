@@ -11,8 +11,9 @@ from pathlib import Path
 
 import cv2
 import numpy as np
-from PyQt5.QtCore import Qt
+from PyQt5.QtCore import Qt, QTimer
 from PyQt5.QtWidgets import (
+    QCheckBox,
     QFileDialog,
     QFrame,
     QHBoxLayout,
@@ -95,6 +96,10 @@ class MainWindow(QMainWindow):
         self._last_qr = None
         self._last_color_coverage = []
         self._color_logic_valid = True
+        self._preview_timer = QTimer(self)
+        self._preview_timer.setSingleShot(True)
+        self._preview_timer.setInterval(180)
+        self._preview_timer.timeout.connect(self._run_preview)
 
         self._build_ui()
 
@@ -163,11 +168,19 @@ class MainWindow(QMainWindow):
         self._layers_panel.setStyleSheet("background:#0d0d1a; border-radius:8px; border:1px solid #2e2e4a;")
         lp = QVBoxLayout(self._layers_panel)
         self._layers_tabs = QTabWidget()
+        self._color_tab = QWidget()
+        color_tab_layout = QVBoxLayout(self._color_tab)
+        color_tab_layout.setContentsMargins(6, 6, 6, 6)
+        color_tab_layout.setSpacing(6)
+        self._show_original_pin = QCheckBox("Pinned: show original image")
+        self._show_original_pin.toggled.connect(lambda _checked: self._apply_layer_preview())
+        color_tab_layout.addWidget(self._show_original_pin)
         self._color_layer_list = QListWidget()
+        color_tab_layout.addWidget(self._color_layer_list)
         self._layer_list = QListWidget()
         self._layer_list.itemChanged.connect(self._on_layer_visibility_changed)
         self._color_layer_list.itemChanged.connect(self._on_layer_visibility_changed)
-        self._layers_tabs.addTab(self._color_layer_list, "Colour Layers")
+        self._layers_tabs.addTab(self._color_tab, "Colour Layers")
         self._layers_tabs.addTab(self._layer_list, "Stencil Layers")
         self._layers_tabs.setCurrentIndex(0)
         self._layers_tabs.currentChanged.connect(lambda _i: self._apply_layer_preview())
@@ -212,13 +225,20 @@ class MainWindow(QMainWindow):
 
     def _on_colors_changed(self, _n: int):
         if self._raw_image is not None:
-            self._on_preview()
+            self._queue_preview_update()
 
     def _on_color_logic_changed(self):
         self._update_color_logic_state()
+        self._populate_colour_layers_preview()
         self._apply_layer_preview()
 
     def _on_preview(self):
+        self._queue_preview_update()
+
+    def _queue_preview_update(self):
+        self._preview_timer.start()
+
+    def _run_preview(self):
         if self._raw_image is None:
             return
         requested = self._panel.n_colors.value()
@@ -339,10 +359,12 @@ class MainWindow(QMainWindow):
         self._color_layer_list.clear()
         if self._last_qr is None:
             return
+        allowed_idxs = set(self._panel.swatch_bar.owned_indices())
         for idx in range(self._last_qr.n_colors):
             color_item = QListWidgetItem(f"Colour C{idx + 1}")
             color_item.setFlags(color_item.flags() | Qt.ItemIsUserCheckable)
-            color_item.setCheckState(Qt.Checked)
+            enabled = (not allowed_idxs) or (idx in allowed_idxs)
+            color_item.setCheckState(Qt.Checked if enabled else Qt.Unchecked)
             self._color_layer_list.addItem(color_item)
 
     def _on_layer_visibility_changed(self, _item: QListWidgetItem):
@@ -350,6 +372,9 @@ class MainWindow(QMainWindow):
 
     def _apply_layer_preview(self):
         if self._last_qr is None:
+            return
+        if self._show_original_pin.isChecked() and self._raw_image is not None:
+            self._preview.show_image(self._raw_image, "Original Image (pinned)")
             return
         visible_idxs: set[int] = set()
         active_list = self._color_layer_list if self._layers_tabs.currentIndex() == 0 else self._layer_list
@@ -397,16 +422,14 @@ class MainWindow(QMainWindow):
     def _update_color_logic_state(self):
         effective = self._effective_color_count()
         self._panel.set_real_color_count(effective)
-        requested = self._panel.n_colors.value()
-        skipped = len(self._panel.swatch_bar.skipped_indices())
-        valid = requested >= skipped
+        valid = effective > 0 if self._last_qr is not None else True
         self._color_logic_valid = valid
         if valid:
             self._panel.set_color_logic_validity(True)
         else:
             self._panel.set_color_logic_validity(
                 False,
-                f"Maximum colours ({requested}) is below skipped colours ({skipped}).",
+                "No active colours selected. Toggle at least one 'Use' button.",
             )
         has_img = self._raw_image is not None
         self._panel.generate_btn.setEnabled(has_img and valid)
