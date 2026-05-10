@@ -150,7 +150,6 @@ class ColourLogicBar(QWidget):
             return None
         return t
 
-
     def _load_owned_hexes(self):
         raw = self._settings.value("owned_hexes", [], type=list)
         self._owned_entries = []
@@ -164,7 +163,8 @@ class ColourLogicBar(QWidget):
                 use = True
                 lock = True
             if hx:
-                self._owned_entries.append({"hex": hx, "use": use, "lock": lock})
+                threshold = int(rec.get("threshold", 80)) if isinstance(rec, dict) else 80
+                self._owned_entries.append({"hex": hx, "use": use, "lock": lock, "threshold": threshold})
         self._owned_entries.sort(key=lambda e: e["hex"])
         self._render_owned_hexes()
 
@@ -221,15 +221,57 @@ class ColourLogicBar(QWidget):
             row_layout.addWidget(use_btn)
             row_layout.addWidget(lock_btn)
             row_layout.addWidget(remove_btn)
-            self._owned_rows_layout.addWidget(row_widget)
-            self._owned_rows.append({"hex": hx, "btn": use_btn, "lock_btn": lock_btn})
+
+            # Threshold row: slider (0=tight … 441=any) + value label
+            thresh_row_widget = QWidget()
+            thresh_row = QHBoxLayout(thresh_row_widget)
+            thresh_row.setContentsMargins(22, 0, 0, 0)
+            thresh_row.setSpacing(6)
+            thresh_row.addWidget(QLabel("Match range:"))
+
+            from PyQt5.QtWidgets import QSlider
+            thresh_slider = QSlider(Qt.Horizontal)
+            thresh_slider.setRange(0, 441)
+            # Load saved threshold for this hex, default 80
+            saved_thresh = entry.get("threshold", 80)
+            thresh_slider.setValue(int(saved_thresh))
+            thresh_slider.setFixedWidth(120)
+
+            thresh_val_label = QLabel(f"{int(saved_thresh)}")
+            thresh_val_label.setStyleSheet("font-size:10px; color:#aaa; min-width:28px;")
+            thresh_slider.valueChanged.connect(
+                lambda v, lbl=thresh_val_label: lbl.setText(str(v))
+            )
+            thresh_slider.valueChanged.connect(
+                lambda v, h=hx: self._set_owned_threshold(h, v)
+            )
+            thresh_slider.valueChanged.connect(self.state_changed.emit)
+
+            thresh_row.addWidget(thresh_slider)
+            thresh_row.addWidget(thresh_val_label)
+            thresh_row.addStretch()
+
+            # Stack the two rows in a tiny vertical container
+            container = QWidget()
+            container_layout = QVBoxLayout(container)
+            container_layout.setContentsMargins(0, 0, 0, 2)
+            container_layout.setSpacing(2)
+            container_layout.addWidget(row_widget)
+            container_layout.addWidget(thresh_row_widget)
+
+            self._owned_rows_layout.addWidget(container)
+            self._owned_rows.append({
+                "hex": hx, "btn": use_btn, "lock_btn": lock_btn,
+                "thresh_slider": thresh_slider,
+            })
+
 
     def _add_owned_hex(self):
         hx = self._normalize_hex(self.hex_input.text())
         if not hx:
             return
         if hx not in [e["hex"] for e in self._owned_entries]:
-            self._owned_entries.append({"hex": hx, "use": True, "lock": True})
+            self._owned_entries.append({"hex": hx, "use": True, "lock": True, "threshold": 80})
             self._owned_entries.sort(key=lambda e: e["hex"])
             self._save_owned_hexes()
             self._render_owned_hexes()
@@ -242,7 +284,6 @@ class ColourLogicBar(QWidget):
             return
         self.hex_input.setText(color.name().upper())
         self._add_owned_hex()
-
 
     def _set_owned_use(self, hx: str, use: bool):
         for entry in self._owned_entries:
@@ -257,6 +298,22 @@ class ColourLogicBar(QWidget):
                 entry["lock"] = bool(locked)
                 break
         self._save_owned_hexes()
+
+    def _set_owned_threshold(self, hx: str, value: int):
+        for entry in self._owned_entries:
+            if entry["hex"] == hx:
+                entry["threshold"] = int(value)
+                break
+        self._save_owned_hexes()
+
+    def owned_thresholds(self) -> dict[str, float]:
+        """Return {hex: threshold} for all in-use owned colours."""
+        result = {}
+        for row in self._owned_rows:
+            hx = row["hex"]
+            slider = row.get("thresh_slider")
+            result[hx] = float(slider.value()) if slider else 441.0
+        return result
 
     def _remove_owned_hex(self, hx: str):
         self._owned_entries = [e for e in self._owned_entries if e["hex"] != hx]
@@ -273,7 +330,7 @@ class ColourLogicBar(QWidget):
         merged = {e["hex"]: e for e in self._owned_entries}
         for hx in lines:
             if hx and hx not in merged:
-                merged[hx] = {"hex": hx, "use": True, "lock": True}
+                merged[hx] = {"hex": hx, "use": True, "lock": True, "threshold": 80}
         self._owned_entries = sorted(merged.values(), key=lambda e: e["hex"])
         self._save_owned_hexes()
         self._render_owned_hexes()
@@ -358,27 +415,97 @@ class ColourLogicBar(QWidget):
             else:
                 row["label"].setText(row["hex"])
 
+    # ── Image / K-means data for live preview ────────────────────────────────
+
+    def set_kmeans_centers(self, centers_bgr: "np.ndarray | None"):
+        """Store current K-means BGR centroids (used only for computer-colour preview)."""
+        self._kmeans_centers_bgr = centers_bgr
+
+    def set_canvas_image(self, image_bgr: "np.ndarray | None"):
+        """
+        Store the resized canvas image so palette-mode preview can run the
+        same nearest-colour assignment as the generator.
+        Call from _run_preview() after resizing.
+        """
+        self._canvas_image_bgr = image_bgr
+
+    def get_palette_assignment(self):
+        """
+        Build a PaletteMap for owned colours against the stored canvas image.
+        B0 is NOT included — it is always a solid plate and not pixel-assigned.
+        Returns None if no owned colours are active or no image is loaded.
+        """
+        from core.palette_mapper import build_palette_map, PaletteEntry
+        image = getattr(self, "_canvas_image_bgr", None)
+        if image is None:
+            return None
+        owned_hexes = self.in_use_owned_hexes()
+        if not owned_hexes:
+            return None
+        owned_entries = []
+        thresholds = {}
+        for rank, hx in enumerate(owned_hexes, start=1):
+            owned_entries.append(PaletteEntry(label=f"O{rank}", rgb=self._hex_str_to_rgb(hx)))
+            t = next(
+                (e.get("threshold", 80) for e in self._owned_entries if e["hex"] == hx),
+                80,
+            )
+            thresholds[f"O{rank}"] = float(t)
+        return build_palette_map(image, owned_entries, thresholds=thresholds)
+
+    @staticmethod
+    def _hex_str_to_rgb(hx: str) -> tuple[int, int, int]:
+        hx = hx.lstrip("#")
+        return int(hx[0:2], 16), int(hx[2:4], 16), int(hx[4:6], 16)
+
+    # ── layer entries for the UI list and preview ─────────────────────────────
+
     def active_layer_entries(self) -> list[dict]:
-        owned_rank: dict[str, int] = {}
-        for hx in self.in_use_owned_hexes():
-            if hx not in owned_rank:
-                owned_rank[hx] = len(owned_rank) + 1
+        """
+        Return one entry per active layer in display order.
 
+        Palette mode (background or any owned colour enabled):
+            B0   → kind="background", palette_label="B0"
+            O1…  → kind="owned",      palette_label="O1" …
+            (computer colour rows are not shown)
+
+        Computer-colour mode (nothing owned, background off):
+            C1…  → kind="color",      cluster_indices=[idx]
+        """
+        owned_in_use = self.in_use_owned_hexes()
+        use_palette = self.background_enabled() or bool(owned_in_use)
         entries = []
-        c_rank = 1
-        if self.background_enabled():
-            entries.append({"label": "B0", "source_idx": None, "kind": "background"})
 
-        for row in self._rows:
-            if not row["btn"].isChecked():
-                continue
-            if row["hex"] in owned_rank:
-                label = f"O{owned_rank[row['hex']]}"
-            else:
-                label = f"C{c_rank}"
+        if use_palette:
+            if self.background_enabled():
+                entries.append({
+                    "label": "B0", "kind": "background",
+                    "palette_label": "B0", "cluster_indices": [],
+                    "hex": self._background_hex,
+                })
+            for rank, hx in enumerate(owned_in_use, start=1):
+                entries.append({
+                    "label": f"O{rank}", "kind": "owned",
+                    "palette_label": f"O{rank}", "cluster_indices": [],
+                    "hex": hx,
+                })
+        else:
+            c_rank = 1
+            for row in self._rows:
+                if not row["btn"].isChecked():
+                    continue
+                entries.append({
+                    "label": f"C{c_rank}", "kind": "color",
+                    "palette_label": None, "cluster_indices": [row["idx"]],
+                    "hex": row["hex"],
+                })
                 c_rank += 1
-            entries.append({"label": label, "source_idx": row["idx"], "kind": "color"})
+
         return entries
+
+    def _resolve_owned_clusters(self, _hex: str) -> list[int]:
+        """Kept for _effective_color_count compat; no longer used for preview."""
+        return []
 
     def _sync_use_style(self, btn: QPushButton):
         if btn.isChecked():
@@ -401,8 +528,17 @@ class ColourLogicBar(QWidget):
                 result.append(row["hex"])
         return result
 
-    def owned_indices(self) -> list[int]:
+    def active_computer_indices(self) -> list[int]:
+        """Return K-means cluster indices whose 'Use' button is checked."""
         return [r["idx"] for r in self._rows if r["btn"].isChecked()]
+
+    def active_owned_hexes(self) -> list[str]:
+        """Return owned-colour hex strings whose 'Use' button is checked."""
+        return self.in_use_owned_hexes()
+
+    # kept for backwards-compat (used by optimise helpers)
+    def owned_indices(self) -> list[int]:
+        return self.active_computer_indices()
 
     def skipped_indices(self) -> list[int]:
         return [r["idx"] for r in self._rows if not r["btn"].isChecked()]
@@ -644,7 +780,13 @@ class ControlPanel(QWidget):
             "thickness_mm": self.thickness.value(),
             "thicken_edges": self.thicken_edges.isChecked(),
             "tolerance_pct": float(self.tol_slider.value()),
-            "owned_colour_indices": self.swatch_bar.owned_indices(),
+            # Indices of K-means computer colours whose "Use" button is ON
+            "active_computer_indices": self.swatch_bar.active_computer_indices(),
+            # Owned colour hex strings whose "Use" button is ON
+            "active_owned_hexes": self.swatch_bar.active_owned_hexes(),
+            # Per-owned-colour distance threshold {hex: float}
+            "owned_thresholds": self.swatch_bar.owned_thresholds(),
+            # Background
             "background_hex": self.swatch_bar.background_hex(),
             "background_enabled": self.swatch_bar.background_enabled(),
         }

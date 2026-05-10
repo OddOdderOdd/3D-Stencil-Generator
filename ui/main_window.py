@@ -80,6 +80,11 @@ QTabBar::tab {
 QTabBar::tab:selected { background:#253560; color:#fff; }
 """
 
+# Qt.UserRole slots used on QListWidgetItems in the colour-layer list
+_ROLE_CLUSTERS = Qt.UserRole          # list[int] — K-means cluster indices
+_ROLE_KIND     = Qt.UserRole + 1      # str — "background" | "owned" | "color"
+_ROLE_HEX      = Qt.UserRole + 2      # str — representative hex colour
+
 
 class MainWindow(QMainWindow):
     def __init__(self):
@@ -199,11 +204,11 @@ class MainWindow(QMainWindow):
         body_split.setStretchFactor(1, 1)
         body_split.setSizes([370, 960])
 
+    # ── upload ────────────────────────────────────────────────────────────────
+
     def _on_upload(self):
         path, _ = QFileDialog.getOpenFileName(
-            self,
-            "Open image",
-            "",
+            self, "Open image", "",
             "Images (*.png *.jpg *.jpeg *.bmp *.tiff *.webp)",
         )
         if not path:
@@ -215,7 +220,10 @@ class MainWindow(QMainWindow):
 
         self._image_path = path
         self._raw_image = img
-        run_dir = Path(path).parent / f"{Path(path).stem}_stencils_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+        run_dir = (
+            Path(path).parent
+            / f"{Path(path).stem}_stencils_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+        )
         run_dir.mkdir(parents=True, exist_ok=True)
         self._output_dir = str(run_dir)
         h, w = img.shape[:2]
@@ -224,6 +232,8 @@ class MainWindow(QMainWindow):
 
         self._preview.show_image(img, "Original Image")
         self._on_preview()
+
+    # ── preview pipeline ──────────────────────────────────────────────────────
 
     def _on_colors_changed(self, _n: int):
         if self._raw_image is not None:
@@ -245,11 +255,28 @@ class MainWindow(QMainWindow):
             return
         requested = self._panel.n_colors.value()
         self._last_qr = quantize(self._raw_image, requested)
-        self._last_color_coverage = self._compute_coverage(self._last_qr.label_map, self._last_qr.n_colors)
+        self._last_color_coverage = self._compute_coverage(
+            self._last_qr.label_map, self._last_qr.n_colors
+        )
+        # Give the swatch bar both the K-means centres and the resized canvas
+        # image so it can run palette-mode assignment for owned-colour preview.
+        self._panel.swatch_bar.set_kmeans_centers(self._last_qr.centers_bgr)
+        from core.tiler import canvas_size_px
+        p = self._panel.get_params()
+        cw_px, ch_px = canvas_size_px(p["canvas_w_mm"], p["canvas_h_mm"])
+        import cv2 as _cv2
+        canvas_bgr = _cv2.resize(self._raw_image, (cw_px, ch_px), interpolation=_cv2.INTER_AREA)
+        self._panel.swatch_bar.set_canvas_image(canvas_bgr)
+
         self._update_color_logic_state()
         used = self._effective_color_count()
-        self._preview.show_image(self._last_qr.quantized_image, f"Quantised Preview ({used} active colours)")
-        self._panel.swatch_bar.set_colors([tuple(c) for c in self._last_qr.centers_bgr.tolist()])
+        self._preview.show_image(
+            self._last_qr.quantized_image,
+            f"Quantised Preview ({used} active colours)",
+        )
+        self._panel.swatch_bar.set_colors(
+            [tuple(c) for c in self._last_qr.centers_bgr.tolist()]
+        )
         self._populate_colour_layers_preview()
         self._update_color_logic_state()
 
@@ -260,13 +287,19 @@ class MainWindow(QMainWindow):
         if self._raw_image is None:
             return
         p = self._panel.get_params()
-        grid = compute_tile_grid(p["canvas_w_mm"], p["canvas_h_mm"], p["bed_w_mm"], p["bed_h_mm"])
+        grid = compute_tile_grid(
+            p["canvas_w_mm"], p["canvas_h_mm"], p["bed_w_mm"], p["bed_h_mm"]
+        )
         self._preview.set_grid_overlay(grid.n_cols, grid.n_rows, True)
+
+    # ── optimise helpers ──────────────────────────────────────────────────────
 
     def _on_optimise_colours(self):
         if self._last_qr is None:
             return
-        self._panel.swatch_bar.optimise_for_coverage(self._last_color_coverage, float(self._panel.tol_slider.value()))
+        self._panel.swatch_bar.optimise_for_coverage(
+            self._last_color_coverage, float(self._panel.tol_slider.value())
+        )
         self._update_color_logic_state()
         self._populate_colour_layers_preview()
         self._apply_layer_preview()
@@ -278,8 +311,13 @@ class MainWindow(QMainWindow):
         for idx, bgr in enumerate(self._last_qr.centers_bgr.tolist()):
             r, g, b = int(bgr[2]), int(bgr[1]), int(bgr[0])
             hx = f"#{r:02X}{g:02X}{b:02X}"
-            coverage_by_hex[hx] = self._last_color_coverage[idx] if idx < len(self._last_color_coverage) else 0.0
-        self._panel.swatch_bar.optimise_owned_for_coverage(coverage_by_hex, float(self._panel.tol_slider.value()))
+            coverage_by_hex[hx] = (
+                self._last_color_coverage[idx]
+                if idx < len(self._last_color_coverage) else 0.0
+            )
+        self._panel.swatch_bar.optimise_owned_for_coverage(
+            coverage_by_hex, float(self._panel.tol_slider.value())
+        )
         self._update_color_logic_state()
         self._populate_colour_layers_preview()
         self._apply_layer_preview()
@@ -287,7 +325,10 @@ class MainWindow(QMainWindow):
     def _on_optimise_background_colour(self):
         if self._last_qr is None or not self._last_qr.centers_bgr.size:
             return
-        dominant_idx = int(np.argmax(np.array(self._last_color_coverage))) if self._last_color_coverage else 0
+        dominant_idx = (
+            int(np.argmax(np.array(self._last_color_coverage)))
+            if self._last_color_coverage else 0
+        )
         dominant_idx = max(0, min(dominant_idx, len(self._last_qr.centers_bgr) - 1))
         bgr = self._last_qr.centers_bgr[dominant_idx]
         hx = f"#{int(bgr[2]):02X}{int(bgr[1]):02X}{int(bgr[0]):02X}"
@@ -295,12 +336,17 @@ class MainWindow(QMainWindow):
         self._populate_colour_layers_preview()
         self._apply_layer_preview()
 
+    # ── generation ────────────────────────────────────────────────────────────
+
     def _on_generate(self):
         if self._image_path is None:
             QMessageBox.warning(self, "No image", "Please upload an image first.")
             return
         if not self._color_logic_valid:
-            QMessageBox.warning(self, "Invalid colour logic", "Fix colour logic warning before generating.")
+            QMessageBox.warning(
+                self, "Invalid colour logic",
+                "Fix colour logic warning before generating.",
+            )
             return
 
         self._log.clear()
@@ -326,7 +372,10 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "Nothing to export", "Generate stencils first.")
             return
         params = self._panel.get_params()
-        grid = compute_tile_grid(params["canvas_w_mm"], params["canvas_h_mm"], params["bed_w_mm"], params["bed_h_mm"])
+        grid = compute_tile_grid(
+            params["canvas_w_mm"], params["canvas_h_mm"],
+            params["bed_w_mm"], params["bed_h_mm"],
+        )
         dlg = ExportDialog(
             self._plates,
             self._output_dir,
@@ -344,6 +393,8 @@ class MainWindow(QMainWindow):
     def _on_settings_clicked(self):
         QMessageBox.information(self, "Settings", "Global settings are not implemented yet.")
 
+    # ── log / progress ────────────────────────────────────────────────────────
+
     def _append_log(self, msg: str):
         self._log.append(msg)
         bar = self._log.verticalScrollBar()
@@ -359,13 +410,17 @@ class MainWindow(QMainWindow):
         self._progress.setValue(100)
         self._populate_layers_panel()
 
+    # ── layers panel (post-generation stencil list) ───────────────────────────
+
     def _populate_layers_panel(self):
         self._layer_list.blockSignals(True)
         self._color_layer_list.blockSignals(True)
         self._layer_list.clear()
         self._populate_colour_layers_preview()
         if not self._plates:
-            self._logic_text.setPlainText("Generate stencils to view tile-by-tile stencil breakdown.")
+            self._logic_text.setPlainText(
+                "Generate stencils to view tile-by-tile stencil breakdown."
+            )
             self._layer_list.blockSignals(False)
             self._color_layer_list.blockSignals(False)
             return
@@ -375,31 +430,60 @@ class MainWindow(QMainWindow):
             grouped.setdefault(p.color_idx, []).append(p)
 
         for color_idx in sorted(grouped):
-            item = QListWidgetItem(f"Colour C{color_idx} ({len(grouped[color_idx])} tile(s))")
+            item = QListWidgetItem(
+                f"Colour C{color_idx} ({len(grouped[color_idx])} tile(s))"
+            )
             item.setFlags(item.flags() | Qt.ItemIsUserCheckable)
             item.setCheckState(Qt.Checked)
             self._layer_list.addItem(item)
+
         lines = ["Generated stencil logic:"]
         for color_idx in sorted(grouped):
             cov = np.mean([p.coverage_pct for p in grouped[color_idx]])
-            lines.append(f"- C{color_idx}: {len(grouped[color_idx])} plate(s), avg coverage {cov:.1f}%")
+            lines.append(
+                f"- C{color_idx}: {len(grouped[color_idx])} plate(s), "
+                f"avg coverage {cov:.1f}%"
+            )
         self._logic_text.setText("\n".join(lines))
 
         self._layer_list.blockSignals(False)
         self._color_layer_list.blockSignals(False)
         self._apply_layer_preview()
 
+    # ── colour layers preview list ────────────────────────────────────────────
+
     def _populate_colour_layers_preview(self):
+        """
+        Rebuild the Colour Layers list from the swatch bar's active_layer_entries().
+
+        Each item stores:
+          _ROLE_CLUSTERS  list[int]  — K-means cluster indices to highlight
+          _ROLE_KIND      str        — "background" | "owned" | "color"
+          _ROLE_HEX       str        — representative hex for swatch colouring
+        """
+        self._color_layer_list.blockSignals(True)
         self._color_layer_list.clear()
+
         if self._last_qr is None:
+            self._color_layer_list.blockSignals(False)
             return
+
         for entry in self._panel.swatch_bar.active_layer_entries():
-            color_item = QListWidgetItem(f"Colour {entry['label']}")
+            kind    = entry["kind"]
+            label   = entry["label"]
+            clusters = entry.get("cluster_indices", [])
+            hx      = entry.get("hex", "#888888")
+
+            display = f"  {label}  {hx}"
+            color_item = QListWidgetItem(display)
             color_item.setFlags(color_item.flags() | Qt.ItemIsUserCheckable)
-            color_item.setData(Qt.UserRole, entry["source_idx"])
-            color_item.setData(Qt.UserRole + 1, entry["kind"])
             color_item.setCheckState(Qt.Checked)
+            color_item.setData(_ROLE_CLUSTERS, clusters)
+            color_item.setData(_ROLE_KIND,     kind)
+            color_item.setData(_ROLE_HEX,      hx)
             self._color_layer_list.addItem(color_item)
+
+        self._color_layer_list.blockSignals(False)
 
     def _on_layer_visibility_changed(self, _item: QListWidgetItem):
         self._apply_layer_preview()
@@ -407,36 +491,108 @@ class MainWindow(QMainWindow):
     def _apply_layer_preview(self):
         if self._last_qr is None:
             return
+
         if self._show_original_pin.isChecked() and self._raw_image is not None:
             self._preview.show_image(self._raw_image, "Original Image (pinned)")
             return
-        visible_idxs: set[int] = set()
-        active_list = self._color_layer_list if self._layers_tabs.currentIndex() == 0 else self._layer_list
+
+        active_list = (
+            self._color_layer_list
+            if self._layers_tabs.currentIndex() == 0
+            else self._layer_list
+        )
+
+        # Collect which items are checked and whether we're in palette mode
+        checked_items = []
         for i in range(active_list.count()):
             item = active_list.item(i)
             if item.checkState() == Qt.Checked:
-                src_idx = item.data(Qt.UserRole)
-                kind = item.data(Qt.UserRole + 1)
-                if kind == "background":
-                    continue
-                if src_idx is None:
-                    label = item.text().split()[1]
-                    src_idx = int(label[1:]) - 1
-                visible_idxs.add(int(src_idx))
+                checked_items.append(item)
 
-        if not visible_idxs:
+        if not checked_items:
             blank = np.zeros_like(self._last_qr.quantized_image)
             self._preview.show_image(blank, "Layer Preview (none visible)")
             return
 
+        # Determine mode from the first entry's kind
+        first_kind = checked_items[0].data(_ROLE_KIND) if checked_items else None
+        use_palette_mode = first_kind in ("background", "owned")
+
         out = self._last_qr.quantized_image.copy()
-        labels = self._last_qr.label_map
-        mask = np.isin(labels, list(visible_idxs))
-        faded = (out * 0.15).astype(np.uint8)
-        out[~mask] = faded[~mask]
-        edge_map = cv2.Canny((mask.astype(np.uint8) * 255), 70, 130)
-        out[edge_map > 0] = (255, 255, 255)
-        self._preview.show_image(out, f"Layer Preview ({len(visible_idxs)} visible)")
+
+        if use_palette_mode:
+            canvas_bgr = getattr(self._panel.swatch_bar, "_canvas_image_bgr", None)
+            base = canvas_bgr if canvas_bgr is not None else out
+
+            # Separate background vs owned items
+            bg_checked    = any(i.data(_ROLE_KIND) == "background" for i in checked_items)
+            owned_checked = [i for i in checked_items if i.data(_ROLE_KIND) == "owned"]
+
+            if bg_checked and not owned_checked:
+                # Background alone: always a solid full plate → show entire image
+                self._preview.show_image(base, "Layer Preview — B0 (solid base coat)")
+                return
+
+            # For owned layers we need the assignment map
+            pmap = self._panel.swatch_bar.get_palette_assignment()
+
+            if not owned_checked:
+                blank = np.zeros_like(base)
+                self._preview.show_image(blank, "Layer Preview (none visible)")
+                return
+
+            if pmap is None:
+                # No owned colours configured yet
+                self._preview.show_image(base, "Layer Preview (no owned colours)")
+                return
+
+            h, w = pmap.assignment_map.shape
+            mask = np.zeros((h, w), dtype=bool)
+            for item in owned_checked:
+                lbl = item.data(_ROLE_CLUSTERS)   # palette_label stored here
+                if lbl:
+                    idx = pmap._index_of(lbl)
+                    if idx >= 0:
+                        mask |= (pmap.assignment_map == idx)
+
+            if bg_checked:
+                # Background + owned: everything is visible (bg catches unassigned)
+                mask = np.ones((h, w), dtype=bool)
+
+            import cv2 as _cv2
+            if base.shape[0] != h or base.shape[1] != w:
+                base = _cv2.resize(base, (w, h))
+
+            faded  = (base * 0.15).astype(np.uint8)
+            result = base.copy()
+            result[~mask] = faded[~mask]
+            edge_map = _cv2.Canny((mask.astype(np.uint8) * 255), 70, 130)
+            result[edge_map > 0] = (255, 255, 255)
+            n_shown = len(owned_checked) + (1 if bg_checked else 0)
+            self._preview.show_image(result, f"Layer Preview ({n_shown} layer(s))")
+
+        else:
+            # Computer-colour mode: use K-means label map
+            visible_clusters: set[int] = set()
+            for item in checked_items:
+                clusters = item.data(_ROLE_CLUSTERS)
+                if clusters:
+                    visible_clusters.update(clusters)
+
+            if not visible_clusters:
+                blank = np.zeros_like(out)
+                self._preview.show_image(blank, "Layer Preview (none visible)")
+                return
+
+            labels = self._last_qr.label_map
+            mask = np.isin(labels, list(visible_clusters))
+            faded = (out * 0.15).astype(np.uint8)
+            out[~mask] = faded[~mask]
+            edge_map = cv2.Canny((mask.astype(np.uint8) * 255), 70, 130)
+            out[edge_map > 0] = (255, 255, 255)
+            self._preview.show_image(out, f"Layer Preview ({len(visible_clusters)} cluster(s))")
+
+    # ── coverage / colour counting ────────────────────────────────────────────
 
     def _compute_coverage(self, label_map: np.ndarray, n_colors: int) -> list[float]:
         total = float(label_map.size)
@@ -450,10 +606,21 @@ class MainWindow(QMainWindow):
         tolerance = float(self._panel.tol_slider.value())
         skipped = set(self._panel.swatch_bar.skipped_indices())
         active = 1 if self._panel.swatch_bar.background_enabled() else 0
+        # count active owned colours
+        active += len(self._panel.swatch_bar.active_owned_hexes())
+        # count computer colours that are not skipped, not claimed by owned, and above tolerance
+        claimed: set[int] = set()
+        for hx in self._panel.swatch_bar.active_owned_hexes():
+            claimed.update(self._panel.swatch_bar._resolve_owned_clusters(hx))
         for idx in range(self._last_qr.n_colors):
-            coverage = self._last_color_coverage[idx] if idx < len(self._last_color_coverage) else 0.0
             if idx in skipped:
                 continue
+            if idx in claimed:
+                continue
+            coverage = (
+                self._last_color_coverage[idx]
+                if idx < len(self._last_color_coverage) else 0.0
+            )
             if coverage < tolerance:
                 continue
             active += 1
