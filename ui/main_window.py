@@ -105,6 +105,9 @@ class MainWindow(QMainWindow):
         self._preview_timer.setSingleShot(True)
         self._preview_timer.setInterval(180)
         self._preview_timer.timeout.connect(self._run_preview)
+        self._slow_pc_mode = QSettings("3d-stencil-generator", "app").value(
+            "slow_pc_mode", False, type=bool
+        )
 
         self._build_ui()
 
@@ -117,6 +120,20 @@ class MainWindow(QMainWindow):
 
         top = QHBoxLayout()
         top.addStretch()
+        self._slow_pc_btn = QToolButton()
+        self._slow_pc_btn.setText("🐢")
+        self._slow_pc_btn.setToolTip(
+            "Slow PC mode: wait 1.5 s after a setting changes before updating preview\n"
+            "(prevents freezing on slower machines)"
+        )
+        self._slow_pc_btn.setCheckable(True)
+        self._slow_pc_btn.setChecked(self._slow_pc_mode)
+        self._slow_pc_btn.setStyleSheet(
+            "QToolButton:checked { background:#2a3a1a; color:#8f8; border-radius:4px; }"
+        )
+        self._slow_pc_btn.toggled.connect(self._on_slow_pc_toggled)
+        top.addWidget(self._slow_pc_btn)
+
         self._settings_btn = QToolButton()
         self._settings_btn.setText("⚙")
         self._settings_btn.setToolTip("Settings")
@@ -390,6 +407,14 @@ class MainWindow(QMainWindow):
         )
         dlg.exec_()
 
+    def _on_slow_pc_toggled(self, checked: bool):
+        self._slow_pc_mode = checked
+        QSettings("3d-stencil-generator", "app").setValue("slow_pc_mode", checked)
+        delay = 1500 if checked else 180
+        self._preview_timer.setInterval(delay)
+        status = "ON (1.5 s delay)" if checked else "OFF (instant)"
+        self._append_log(f"🐢  Slow PC mode {status}")
+
     def _on_settings_clicked(self):
         QMessageBox.information(self, "Settings", "Global settings are not implemented yet.")
 
@@ -454,34 +479,37 @@ class MainWindow(QMainWindow):
 
     def _populate_colour_layers_preview(self):
         """
-        Rebuild the Colour Layers list from the swatch bar's active_layer_entries().
+        Rebuild the Colour Layers list from active_layer_entries().
+        All three kinds (background, owned, color) can appear together.
 
-        Each item stores:
-          _ROLE_CLUSTERS  list[int]  — K-means cluster indices to highlight
-          _ROLE_KIND      str        — "background" | "owned" | "color"
-          _ROLE_HEX       str        — representative hex for swatch colouring
+        _ROLE_CLUSTERS stores:
+          background/owned → palette_label string ("B0", "O1", …)
+          color            → list[int] of K-means cluster indices
         """
         self._color_layer_list.blockSignals(True)
         self._color_layer_list.clear()
 
-        if self._last_qr is None:
-            self._color_layer_list.blockSignals(False)
-            return
-
         for entry in self._panel.swatch_bar.active_layer_entries():
-            kind    = entry["kind"]
-            label   = entry["label"]
-            clusters = entry.get("cluster_indices", [])
-            hx      = entry.get("hex", "#888888")
+            kind  = entry["kind"]
+            label = entry["label"]
+            hx    = entry.get("hex", "#888888")
+
+            # palette-mode entries store their label string; computer entries
+            # store their cluster index list — _apply_layer_preview reads kind
+            # to know which to use.
+            if kind in ("background", "owned"):
+                role_data = entry.get("palette_label", label)
+            else:
+                role_data = entry.get("cluster_indices", [])
 
             display = f"  {label}  {hx}"
-            color_item = QListWidgetItem(display)
-            color_item.setFlags(color_item.flags() | Qt.ItemIsUserCheckable)
-            color_item.setCheckState(Qt.Checked)
-            color_item.setData(_ROLE_CLUSTERS, clusters)
-            color_item.setData(_ROLE_KIND,     kind)
-            color_item.setData(_ROLE_HEX,      hx)
-            self._color_layer_list.addItem(color_item)
+            item = QListWidgetItem(display)
+            item.setFlags(item.flags() | Qt.ItemIsUserCheckable)
+            item.setCheckState(Qt.Checked)
+            item.setData(_ROLE_CLUSTERS, role_data)
+            item.setData(_ROLE_KIND,     kind)
+            item.setData(_ROLE_HEX,      hx)
+            self._color_layer_list.addItem(item)
 
         self._color_layer_list.blockSignals(False)
 
@@ -502,7 +530,7 @@ class MainWindow(QMainWindow):
             else self._layer_list
         )
 
-        # Collect which items are checked and whether we're in palette mode
+        # Collect checked items — all three kinds can coexist
         checked_items = []
         for i in range(active_list.count()):
             item = active_list.item(i)
@@ -514,83 +542,77 @@ class MainWindow(QMainWindow):
             self._preview.show_image(blank, "Layer Preview (none visible)")
             return
 
-        # Determine mode from the first entry's kind
-        first_kind = checked_items[0].data(_ROLE_KIND) if checked_items else None
-        use_palette_mode = first_kind in ("background", "owned")
+        canvas_bgr = getattr(self._panel.swatch_bar, "_canvas_image_bgr", None)
+        base = canvas_bgr if canvas_bgr is not None else self._last_qr.quantized_image
+        h_base, w_base = base.shape[:2]
 
-        out = self._last_qr.quantized_image.copy()
+        has_background = any(i.data(_ROLE_KIND) == "background" for i in checked_items)
+        owned_items    = [i for i in checked_items if i.data(_ROLE_KIND) == "owned"]
+        color_items    = [i for i in checked_items if i.data(_ROLE_KIND) == "color"]
 
-        if use_palette_mode:
-            canvas_bgr = getattr(self._panel.swatch_bar, "_canvas_image_bgr", None)
-            base = canvas_bgr if canvas_bgr is not None else out
+        # B0 alone — solid full plate, show the whole image
+        if has_background and not owned_items and not color_items:
+            self._preview.show_image(base, "Layer Preview — B0 (solid base coat)")
+            return
 
-            # Separate background vs owned items
-            bg_checked    = any(i.data(_ROLE_KIND) == "background" for i in checked_items)
-            owned_checked = [i for i in checked_items if i.data(_ROLE_KIND) == "owned"]
+        # Build combined pixel mask over all active non-background layers
+        combined = np.zeros((h_base, w_base), dtype=bool)
 
-            if bg_checked and not owned_checked:
-                # Background alone: always a solid full plate → show entire image
-                self._preview.show_image(base, "Layer Preview — B0 (solid base coat)")
-                return
-
-            # For owned layers we need the assignment map
+        # Owned layers via palette assignment map
+        if owned_items:
             pmap = self._panel.swatch_bar.get_palette_assignment()
-
-            if not owned_checked:
-                blank = np.zeros_like(base)
-                self._preview.show_image(blank, "Layer Preview (none visible)")
-                return
-
-            if pmap is None:
-                # No owned colours configured yet
-                self._preview.show_image(base, "Layer Preview (no owned colours)")
-                return
-
-            h, w = pmap.assignment_map.shape
-            mask = np.zeros((h, w), dtype=bool)
-            for item in owned_checked:
-                lbl = item.data(_ROLE_CLUSTERS)   # palette_label stored here
-                if lbl:
+            if pmap is not None:
+                ph, pw = pmap.assignment_map.shape
+                for item in owned_items:
+                    lbl = item.data(_ROLE_CLUSTERS)  # palette_label stored here
+                    if not lbl:
+                        continue
                     idx = pmap._index_of(lbl)
-                    if idx >= 0:
-                        mask |= (pmap.assignment_map == idx)
+                    if idx < 0:
+                        continue
+                    m = (pmap.assignment_map == idx)
+                    if (ph, pw) != (h_base, w_base):
+                        m = cv2.resize(m.astype(np.uint8), (w_base, h_base),
+                                       interpolation=cv2.INTER_NEAREST).astype(bool)
+                    combined |= m
 
-            if bg_checked:
-                # Background + owned: everything is visible (bg catches unassigned)
-                mask = np.ones((h, w), dtype=bool)
-
-            import cv2 as _cv2
-            if base.shape[0] != h or base.shape[1] != w:
-                base = _cv2.resize(base, (w, h))
-
-            faded  = (base * 0.15).astype(np.uint8)
-            result = base.copy()
-            result[~mask] = faded[~mask]
-            edge_map = _cv2.Canny((mask.astype(np.uint8) * 255), 70, 130)
-            result[edge_map > 0] = (255, 255, 255)
-            n_shown = len(owned_checked) + (1 if bg_checked else 0)
-            self._preview.show_image(result, f"Layer Preview ({n_shown} layer(s))")
-
-        else:
-            # Computer-colour mode: use K-means label map
-            visible_clusters: set[int] = set()
-            for item in checked_items:
-                clusters = item.data(_ROLE_CLUSTERS)
-                if clusters:
-                    visible_clusters.update(clusters)
-
-            if not visible_clusters:
-                blank = np.zeros_like(out)
-                self._preview.show_image(blank, "Layer Preview (none visible)")
-                return
-
+        # Computer-colour layers via K-means label map
+        if color_items and self._last_qr is not None:
             labels = self._last_qr.label_map
-            mask = np.isin(labels, list(visible_clusters))
-            faded = (out * 0.15).astype(np.uint8)
-            out[~mask] = faded[~mask]
-            edge_map = cv2.Canny((mask.astype(np.uint8) * 255), 70, 130)
-            out[edge_map > 0] = (255, 255, 255)
-            self._preview.show_image(out, f"Layer Preview ({len(visible_clusters)} cluster(s))")
+            kh, kw = labels.shape
+            clusters: set[int] = set()
+            for item in color_items:
+                data = item.data(_ROLE_CLUSTERS)
+                if isinstance(data, list):
+                    clusters.update(data)
+            if clusters:
+                km = np.isin(labels, list(clusters))
+                if (kh, kw) != (h_base, w_base):
+                    km = cv2.resize(km.astype(np.uint8), (w_base, h_base),
+                                    interpolation=cv2.INTER_NEAREST).astype(bool)
+                combined |= km
+
+        # If background is also checked it fills everything not claimed by
+        # owned/computer layers — the whole image is visible
+        if has_background:
+            self._preview.show_image(
+                base,
+                f"Layer Preview ({len(checked_items)} layer(s)) — B0 fills remainder",
+            )
+            return
+
+        if not combined.any():
+            blank = np.zeros_like(base)
+            self._preview.show_image(blank, "Layer Preview (none visible)")
+            return
+
+        faded  = (base * 0.15).astype(np.uint8)
+        result = base.copy()
+        result[~combined] = faded[~combined]
+        edge_map = cv2.Canny((combined.astype(np.uint8) * 255), 70, 130)
+        result[edge_map > 0] = (255, 255, 255)
+        n = len(owned_items) + len(color_items)
+        self._preview.show_image(result, f"Layer Preview ({n} layer(s))")
 
     # ── coverage / colour counting ────────────────────────────────────────────
 

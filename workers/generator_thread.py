@@ -207,116 +207,100 @@ class GeneratorWorker(QThread):
         )
 
         plates: list[PlateInfo] = []
-        use_palette_mode = background_enabled or bool(active_owned_hexes)
+        color_counter = 0
 
         # ══════════════════════════════════════════════════════════════════════
-        # MODE A — palette nearest-colour assignment
+        # K-means quantisation — always run so computer colours are available
+        # even when palette mode is also active.
         # ══════════════════════════════════════════════════════════════════════
-        if use_palette_mode:
-            self._log("\n🎨  Mode: palette assignment")
-
-            # ── Background: always a solid full plate, not pixel-assigned ────
-            color_counter = 0
-            if background_enabled:
-                color_counter += 1
-                bg_rgb = _hex_to_rgb(background_hex)
-                self._log(f"\n  B0 background ({background_hex}) — solid plate")
-                for tile in grid.tiles:
-                    if self._abort:
-                        break
-                    solid_mask = np.full((tile.h_px, tile.w_px), 255, dtype=np.uint8)
-                    self._log(f"\n  🔲  {tile.label}")
-                    self._run_plate(
-                        solid_mask, tile, f"B0_{tile.label}", bg_rgb, 100.0,
-                        color_counter, thickness_mm, thicken_edges,
-                        output_dir, plates,
-                    )
-
-            # ── Owned colours: nearest-within-threshold pixel assignment ─────
-            owned_palette: list[PaletteEntry] = []
-            for rank, hx in enumerate(active_owned_hexes, start=1):
-                owned_palette.append(PaletteEntry(label=f"O{rank}", rgb=_hex_to_rgb(hx)))
-                self._log(f"    O{rank} owned: {hx}")
-
-            if owned_palette:
-                thresh_by_label: dict[str, float] = {}
-                for rank, hx in enumerate(active_owned_hexes, start=1):
-                    if hx in owned_thresholds:
-                        thresh_by_label[f"O{rank}"] = owned_thresholds[hx]
-
-                self._log("    Building pixel-to-owned-colour assignment map…")
-                if thresh_by_label:
-                    self._log(f"    Thresholds: { {k: round(v) for k, v in thresh_by_label.items()} }")
-                pmap = build_palette_map(scaled, owned_palette, thresholds=thresh_by_label)
-                self._progress(15)
-
-                if self._abort:
-                    self._log("Aborted.")
-                    return
-
-                total_work = max(1, len(owned_palette) * len(grid.tiles))
-                work_done  = 0
-
-                for entry in owned_palette:
-                    if self._abort:
-                        break
-                    color_counter += 1
-                    label  = entry.label
-                    rgb    = entry.rgb
-                    hx_str = "#{:02X}{:02X}{:02X}".format(*rgb)
-                    self._log(f"\n  Layer {label} ({hx_str})")
-
-                    for tile in grid.tiles:
-                        if self._abort:
-                            break
-                        work_done += 1
-                        self._progress(15 + int(80 * work_done / total_work))
-                        self._log(f"\n  🔲  {tile.label}")
-
-                        mask     = self._tile_mask_from_palette(pmap, tile, label)
-                        coverage = _coverage_of_mask(mask)
-
-                        if coverage < tolerance_pct:
-                            self._log(
-                                f"    {label}: {coverage:.1f}% — skipped (< {tolerance_pct}%)"
-                            )
-                            continue
-
-                        self._log(f"    {label}: {coverage:.1f}% — generating…")
-                        self._run_plate(
-                            mask, tile, f"{label}_{tile.label}", rgb, coverage,
-                            color_counter, thickness_mm, thicken_edges,
-                            output_dir, plates,
-                        )
-            else:
-                self._progress(15)
-
-        # ══════════════════════════════════════════════════════════════════════
-        # MODE B — classic K-means computer colours
-        # ══════════════════════════════════════════════════════════════════════
-        else:
-            self._log(
-                f"\n💻  Mode: computer colours ({len(active_computer_indices)} active)"
-            )
+        qr: QuantizeResult | None = None
+        if active_computer_indices:
             self._log(f"🎨  Quantising to {requested_n_colors} colours (K-means)…")
-            qr: QuantizeResult = quantize(scaled, requested_n_colors)
-            n_colors = qr.n_colors
-            if n_colors != requested_n_colors:
-                self._log(f"    Requested {requested_n_colors}, effective {n_colors}")
-            self._progress(15)
+            qr = quantize(scaled, requested_n_colors)
+            if qr.n_colors != requested_n_colors:
+                self._log(f"    Requested {requested_n_colors}, effective {qr.n_colors}")
 
+        self._progress(12)
+        if self._abort:
+            self._log("Aborted.")
+            return
+
+        # ══════════════════════════════════════════════════════════════════════
+        # PASS A — Background (B0): always a solid full plate
+        # ══════════════════════════════════════════════════════════════════════
+        if background_enabled:
+            color_counter += 1
+            bg_rgb = _hex_to_rgb(background_hex)
+            self._log(f"\n🖌️  Pass A — B0 background ({background_hex}) — solid plate")
+            for tile in grid.tiles:
+                if self._abort:
+                    break
+                solid_mask = np.full((tile.h_px, tile.w_px), 255, dtype=np.uint8)
+                self._log(f"\n  🔲  {tile.label}")
+                self._run_plate(
+                    solid_mask, tile, f"B0_{tile.label}", bg_rgb, 100.0,
+                    color_counter, thickness_mm, thicken_edges, output_dir, plates,
+                )
+
+        # ══════════════════════════════════════════════════════════════════════
+        # PASS B — Owned colours: nearest-within-threshold pixel assignment
+        # ══════════════════════════════════════════════════════════════════════
+        if active_owned_hexes:
+            self._log(f"\n🎨  Pass B — {len(active_owned_hexes)} owned colour(s)")
+            owned_palette: list[PaletteEntry] = []
+            thresh_by_label: dict[str, float] = {}
+            for rank, hx in enumerate(active_owned_hexes, start=1):
+                lbl = f"O{rank}"
+                owned_palette.append(PaletteEntry(label=lbl, rgb=_hex_to_rgb(hx)))
+                if hx in owned_thresholds:
+                    thresh_by_label[lbl] = owned_thresholds[hx]
+                self._log(f"    {lbl}: {hx}  threshold={thresh_by_label.get(lbl, 80):.0f}")
+
+            self._log("    Building pixel-to-owned-colour assignment map…")
+            pmap = build_palette_map(scaled, owned_palette, thresholds=thresh_by_label)
+            self._progress(18)
             if self._abort:
                 self._log("Aborted.")
                 return
 
+            for entry in owned_palette:
+                if self._abort:
+                    break
+                color_counter += 1
+                label  = entry.label
+                rgb    = entry.rgb
+                hx_str = "#{:02X}{:02X}{:02X}".format(*rgb)
+                self._log(f"\n  Layer {label} ({hx_str})")
+
+                for tile in grid.tiles:
+                    if self._abort:
+                        break
+                    self._log(f"\n  🔲  {tile.label}")
+                    mask     = self._tile_mask_from_palette(pmap, tile, label)
+                    coverage = _coverage_of_mask(mask)
+                    if coverage < tolerance_pct:
+                        self._log(f"    {label}: {coverage:.1f}% — skipped (< {tolerance_pct}%)")
+                        continue
+                    self._log(f"    {label}: {coverage:.1f}% — generating…")
+                    self._run_plate(
+                        mask, tile, f"{label}_{tile.label}", rgb, coverage,
+                        color_counter, thickness_mm, thicken_edges, output_dir, plates,
+                    )
+
+        # ══════════════════════════════════════════════════════════════════════
+        # PASS C — Computer colours: K-means cluster plates
+        # ══════════════════════════════════════════════════════════════════════
+        if active_computer_indices and qr is not None:
+            self._log(f"\n💻  Pass C — {len(active_computer_indices)} computer colour(s)")
+            comp_rank = 0
             total_work = max(1, len(active_computer_indices) * len(grid.tiles))
             work_done  = 0
-            comp_rank  = 0
 
             for color_idx in active_computer_indices:
                 if self._abort:
                     break
                 comp_rank += 1
+                color_counter += 1
                 bgr      = qr.centers_bgr[color_idx]
                 comp_rgb = (int(bgr[2]), int(bgr[1]), int(bgr[0]))
                 hx_str   = "#{:02X}{:02X}{:02X}".format(*comp_rgb)
@@ -327,23 +311,17 @@ class GeneratorWorker(QThread):
                     if self._abort:
                         break
                     work_done += 1
-                    self._progress(15 + int(80 * work_done / total_work))
+                    self._progress(18 + int(77 * work_done / total_work))
                     self._log(f"\n  🔲  {tile.label}")
-
                     mask     = get_tile_mask(qr.label_map, tile, color_idx)
                     coverage = _coverage_of_mask(mask)
-
                     if coverage < tolerance_pct:
-                        self._log(
-                            f"    {lbl}: {coverage:.1f}% — skipped (< {tolerance_pct}%)"
-                        )
+                        self._log(f"    {lbl}: {coverage:.1f}% — skipped (< {tolerance_pct}%)")
                         continue
-
                     self._log(f"    {lbl}: {coverage:.1f}% — generating…")
                     self._run_plate(
                         mask, tile, f"{lbl}_{tile.label}", comp_rgb, coverage,
-                        comp_rank, thickness_mm, thicken_edges,
-                        output_dir, plates,
+                        color_counter, thickness_mm, thicken_edges, output_dir, plates,
                     )
 
         # ── Done ─────────────────────────────────────────────────────────────

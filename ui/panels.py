@@ -463,43 +463,45 @@ class ColourLogicBar(QWidget):
     def active_layer_entries(self) -> list[dict]:
         """
         Return one entry per active layer in display order.
+        All three systems can coexist:
 
-        Palette mode (background or any owned colour enabled):
-            B0   → kind="background", palette_label="B0"
-            O1…  → kind="owned",      palette_label="O1" …
-            (computer colour rows are not shown)
+            B0          → kind="background", palette_label="B0"
+            O1, O2, …  → kind="owned",       palette_label="O1" …
+            C1, C2, …  → kind="color",        cluster_indices=[idx]
 
-        Computer-colour mode (nothing owned, background off):
-            C1…  → kind="color",      cluster_indices=[idx]
+        Computer colours are always shown when their Use button is on,
+        regardless of whether palette mode is also active.
         """
-        owned_in_use = self.in_use_owned_hexes()
-        use_palette = self.background_enabled() or bool(owned_in_use)
         entries = []
+        owned_in_use = self.in_use_owned_hexes()
 
-        if use_palette:
-            if self.background_enabled():
-                entries.append({
-                    "label": "B0", "kind": "background",
-                    "palette_label": "B0", "cluster_indices": [],
-                    "hex": self._background_hex,
-                })
-            for rank, hx in enumerate(owned_in_use, start=1):
-                entries.append({
-                    "label": f"O{rank}", "kind": "owned",
-                    "palette_label": f"O{rank}", "cluster_indices": [],
-                    "hex": hx,
-                })
-        else:
-            c_rank = 1
-            for row in self._rows:
-                if not row["btn"].isChecked():
-                    continue
-                entries.append({
-                    "label": f"C{c_rank}", "kind": "color",
-                    "palette_label": None, "cluster_indices": [row["idx"]],
-                    "hex": row["hex"],
-                })
-                c_rank += 1
+        # B0 — background
+        if self.background_enabled():
+            entries.append({
+                "label": "B0", "kind": "background",
+                "palette_label": "B0", "cluster_indices": [],
+                "hex": self._background_hex,
+            })
+
+        # O1, O2, … — owned colours
+        for rank, hx in enumerate(owned_in_use, start=1):
+            entries.append({
+                "label": f"O{rank}", "kind": "owned",
+                "palette_label": f"O{rank}", "cluster_indices": [],
+                "hex": hx,
+            })
+
+        # C1, C2, … — computer colours (always shown when Use is on)
+        c_rank = 1
+        for row in self._rows:
+            if not row["btn"].isChecked():
+                continue
+            entries.append({
+                "label": f"C{c_rank}", "kind": "color",
+                "palette_label": None, "cluster_indices": [row["idx"]],
+                "hex": row["hex"],
+            })
+            c_rank += 1
 
         return entries
 
